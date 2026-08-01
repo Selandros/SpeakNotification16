@@ -1,0 +1,22 @@
+/* SpeakNotification16.plist — safe injection filter (rootless) */
+{
+    Filter = {
+        Bundles = (
+            "com.apple.springboard",
+            "com.apple.InCallService"
+        );
+        Executables = (
+            "SpringBoard",
+            "InCallService"
+        );
+    };
+    /* Explicitly exclude CarPlay hosts to prevent gesture crashes */
+    DenyBundles = (
+        "com.apple.CarPlayTemplateUIHost",
+        "com.apple.CarPlayUIServer"
+    );
+    DenyExecutables = (
+        "CarPlayTemplateUIHost",
+        "CarPlayUIServer"
+    );
+}

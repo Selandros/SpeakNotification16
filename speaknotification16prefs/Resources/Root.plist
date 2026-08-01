@@ -1,0 +1,362 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+
+        <!-- ACTIVATION -->
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Enable</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>enabled</string>
+            <key>default</key><true/>
+        </dict>
+
+        <!-- SPEAK CONDITIONS -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Speak Conditions</string>
+            <key>footerText</key>
+            <string>Controls when notifications are spoken, how speaking can be cancelled, and whether the original notification sound is suppressed.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Pause music</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>pause</string>
+            <key>default</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSLinkListCell</string>
+            <key>label</key><string>Cancel button</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>cancelButton</string>
+            <key>detail</key><string>PSListItemsController</string>
+            <key>values</key>
+            <array>
+                <string>none</string>
+                <string>power</string>
+                <string>volumeupdown</string>
+                <string>any</string>
+            </array>
+            <key>titles</key>
+            <array>
+                <string>None</string>
+                <string>Power Button</string>
+                <string>Volume Button</string>
+                <string>Any Button</string>
+            </array>
+            <key>validValues</key>
+            <array>
+                <string>none</string>
+                <string>power</string>
+                <string>volumeupdown</string>
+                <string>any</string>
+            </array>
+            <key>validTitles</key>
+            <array>
+                <string>None</string>
+                <string>Power Button</string>
+                <string>Volume Button</string>
+                <string>Any Button</string>
+            </array>
+            <key>default</key><string>power</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Suppress notification sound</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>disableNotificationSound</string>
+            <key>default</key><false/>
+            <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
+        </dict>
+
+        <!-- BLOCK SPEAK ON MUTE -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>footerText</key>
+            <string>When enabled, SpeakNotification will not speak while the device is muted. Built-in speaker behavior can still depend on iOS mute handling.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Block speak on mute</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>blockSpeakOnMute</string>
+            <key>default</key><false/>
+        </dict>
+
+        <!-- ANTI-SPAM -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Anti-spam</string>
+            <key>footerText</key>
+            <string>When repeated-notification muting is enabled, matching notifications are ignored during this cooldown. Set 0 for no cooldown delay.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Mute repeated notifications</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>muteSpam</string>
+            <key>default</key><false/>
+            <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSTitleValueCell</string>
+            <key>label</key><string>Cooldown</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>spamCooldownSeconds</string>
+            <key>default</key><integer>12</integer>
+            <key>min</key><integer>0</integer>
+            <key>max</key><integer>300</integer>
+            <key>step</key><integer>1</integer>
+            <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
+        </dict>
+
+        <!-- QUEUE -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Queue</string>
+            <key>footerText</key>
+            <string>When enabled, new notifications wait until the current spoken notification finishes. When disabled, a new notification can interrupt the current speech.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Queue notifications</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>queueNotifications</string>
+            <key>default</key><false/>
+        </dict>
+
+        <!-- ONLY TRUSTED -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Trusted Connections</string>
+            <key>footerText</key>
+            <string>Only speak when connected to one of the trusted Wi-Fi or Bluetooth entries below.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Only speak on trusted connections</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>onlyTrustedConnection</string>
+            <key>default</key><false/>
+        </dict>
+
+        <!-- BLUETOOTH DEVICES (inline list) -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Bluetooth Devices</string>
+            <key>id</key><string>bt_anchor</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSButtonCell</string>
+            <key>label</key><string>Add current Bluetooth</string>
+            <key>action</key><string>btAddCurrent:</string>
+            <key>id</key><string>bt_add_btn</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Wi-Fi Networks</string>
+            <key>id</key><string>wifi_anchor</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSButtonCell</string>
+            <key>label</key><string>Add current SSID</string>
+            <key>action</key><string>wifiAddCurrent:</string>
+            <key>id</key><string>wifi_add_btn</string>
+        </dict>
+
+        <!-- VOICE & VOLUME -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Voice &amp; Volume</string>
+            <key>footerText</key>
+            <string>Sets the target speech volume. “Change with buttons” controls whether the system volume is adjusted.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSTitleValueCell</string>
+            <key>label</key><string>Speech volume</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>speechVolume</string>
+            <key>default</key><integer>30</integer>
+            <key>min</key><integer>0</integer>
+            <key>max</key><integer>100</integer>
+            <key>step</key><integer>1</integer>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Change with buttons</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>useSystemVolume</string>
+            <key>default</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Reset volume after speaking</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>SNResetVolumeAfterSpeakEnabled</string>
+            <key>default</key><false/>
+            <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
+        </dict>
+        <!-- MESSAGE FORMAT -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Message Format</string>
+            <key>footerText</key>
+            <string>Build the spoken message by inserting parts below. Per-app custom messages can override this global format.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSStaticTextCell</string>
+            <key>id</key><string>global_format_editor</string>
+            <key>formatScope</key><string>global</string>
+            <key>placeholder</key><string>{APP}: {TITLE}: {BODY}</string>
+            <key>height</key><integer>52</integer>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSStaticTextCell</string>
+            <key>label</key><string>Message parts</string>
+            <key>id</key><string>global_format_tokens</string>
+            <key>formatScope</key><string>global</string>
+            <key>height</key><integer>92</integer>
+        </dict>
+
+        <!-- PER-APP CONTROL (consolidated) -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Per-app Control</string>
+            <key>footerText</key>
+            <string>Choose which installed apps can speak and customize per-app behavior.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSLinkCell</string>
+            <key>label</key><string>Installed apps</string>
+            <key>detail</key><string>PerAppListController</string>
+        </dict>
+
+        <!-- COMING -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Coming</string>
+            <key>footerText</key>
+            <string>Planned features that are visible for tracking, but do not work yet.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSLinkCell</string>
+            <key>label</key><string>Planned features</string>
+            <key>detail</key><string>SNComingListController</string>
+        </dict>
+
+        <!-- RELEASE ALERTS -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Release Alerts</string>
+            <key>footerText</key>
+            <string>Checks GitHub Releases for SpeakNotification16 updates.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Enable Release Alerts</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>releaseAlertsEnabled</string>
+            <key>default</key><true/>
+            <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSButtonCell</string>
+            <key>label</key><string>Check Now</string>
+            <key>id</key><string>SNReleaseCheckNow</string>
+            <key>action</key><string>checkReleaseNow</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSTitleValueCell</string>
+            <key>label</key><string>Last Checked</string>
+            <key>id</key><string>SNReleaseLastChecked</string>
+            <key>get</key><string>releaseLastChecked:</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSLinkCell</string>
+            <key>label</key><string>You already have the latest</string>
+            <key>id</key><string>SNReleaseLatestStatus</string>
+            <key>get</key><string>releaseLatestStatus:</string>
+            <key>action</key><string>openLatestRelease:</string>
+        </dict>
+
+        <!-- OTHER -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Other</string>
+            <key>footerText</key>
+            <string>Reset global and per-app settings to their default values.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSButtonCell</string>
+            <key>label</key><string>Reset all settings</string>
+            <key>action</key><string>resetAllSettings</string>
+        </dict>
+
+
+
+        <!-- DEBUG -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Debug</string>
+            <key>footerText</key>
+            <string>Enable local troubleshooting logs. Logs can include notification text and device state.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Enable debug logging</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>debugLoggingEnabled</string>
+            <key>default</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSButtonCell</string>
+            <key>label</key><string>Export debug logs</string>
+            <key>action</key><string>exportDebugLogs</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSButtonCell</string>
+            <key>label</key><string>Delete debug logs…</string>
+            <key>id</key><string>SNDebugDeleteLogs</string>
+            <key>action</key><string>deleteLogWithPicker</string>
+        </dict>
+
+<dict>
+    <!-- Group with header + long footer text, very lightweight -->
+    <key>cell</key>
+    <string>PSGroupCell</string>
+    <key>label</key>
+    <string>ABOUT &amp; DISCLAIMER</string>
+    <key>footerText</key>
+    <string><![CDATA[
+Credits
+This tweak is based on the original SpeakNotification created by Merdok.
+This build adapts the tweak for rootless iOS 16 environments with permission from the original author.
+The current build is maintained by Selandros.
+
+License
+SpeakNotification16 is based on the MIT-licensed original SpeakNotification project.
+See the repository LICENSE file for details.
+
+Private APIs
+This tweak uses private Apple APIs. They are undocumented and unsupported by Apple, and may cause unexpected behavior or instability.
+Use at your own risk.
+
+Logging
+Debug logs are stored locally and may include notification text, app identifiers, volume state, mute state, lock state, route state, and other troubleshooting data.
+Logs are not shared automatically.
+
+No Warranty
+This build is provided as is, without warranty of any kind.
+Use it entirely at your own risk; Selandros is not responsible for damage, data loss, or other issues caused by this build.
+    ]]></string>
+</dict>
+
+
+    </array>
+</dict>
+</plist>

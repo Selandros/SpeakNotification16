@@ -1,0 +1,160 @@
+#!/bin/sh
+set -u
+
+PREFS_DOMAIN="com.selandros.speaknotification16"
+INSTALL_ID_KEY="releaseCurrentInstallID"
+PREFS_FILE="/var/mobile/Library/Preferences/${PREFS_DOMAIN}.plist"
+
+ORIGINAL_PATH="${PATH:-}"
+PATH="/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [ -n "$ORIGINAL_PATH" ]; then
+    PATH="${PATH}:${ORIGINAL_PATH}"
+fi
+export PATH
+
+find_tool() {
+    tool_name="$1"
+    shift
+
+    resolved="$(command -v "$tool_name" 2>/dev/null || true)"
+    if [ -n "$resolved" ] && [ -x "$resolved" ]; then
+        printf '%s\n' "$resolved"
+        return 0
+    fi
+
+    for candidate in "$@"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+DEFAULTS_BIN="$(find_tool defaults \
+    /var/jb/usr/bin/defaults \
+    /var/jb/bin/defaults \
+    /usr/bin/defaults \
+    /bin/defaults || true)"
+
+SU_BIN="$(find_tool su \
+    /var/jb/usr/bin/su \
+    /var/jb/bin/su \
+    /usr/bin/su \
+    /bin/su || true)"
+
+UUIDGEN_BIN="$(find_tool uuidgen \
+    /var/jb/usr/bin/uuidgen \
+    /usr/bin/uuidgen || true)"
+
+HEXDUMP_BIN="$(find_tool hexdump \
+    /var/jb/usr/bin/hexdump \
+    /usr/bin/hexdump || true)"
+
+OD_BIN="$(find_tool od \
+    /var/jb/usr/bin/od \
+    /usr/bin/od || true)"
+
+TR_BIN="$(find_tool tr \
+    /var/jb/usr/bin/tr \
+    /usr/bin/tr \
+    /bin/tr || true)"
+
+CHOWN_BIN="$(find_tool chown \
+    /var/jb/usr/bin/chown \
+    /usr/bin/chown \
+    /bin/chown || true)"
+
+DATE_BIN="$(find_tool date \
+    /var/jb/usr/bin/date \
+    /usr/bin/date \
+    /bin/date || true)"
+
+if [ -n "$DATE_BIN" ]; then
+    TIMESTAMP="$("$DATE_BIN" +%s 2>/dev/null || printf '0')"
+else
+    TIMESTAMP="0"
+fi
+
+RANDOM_PART=""
+
+if [ -n "$UUIDGEN_BIN" ]; then
+    RANDOM_PART="$("$UUIDGEN_BIN" 2>/dev/null || true)"
+    if [ -n "$TR_BIN" ]; then
+        RANDOM_PART="$(printf '%s' "$RANDOM_PART" | "$TR_BIN" -d '-' 2>/dev/null || true)"
+    fi
+fi
+
+if [ -z "$RANDOM_PART" ] && [ -n "$HEXDUMP_BIN" ]; then
+    RANDOM_PART="$("$HEXDUMP_BIN" -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null || true)"
+fi
+
+if [ -z "$RANDOM_PART" ] && [ -n "$OD_BIN" ]; then
+    if [ -n "$TR_BIN" ]; then
+        RANDOM_PART="$("$OD_BIN" -An -N16 -tx1 /dev/urandom 2>/dev/null | "$TR_BIN" -d ' \n' 2>/dev/null || true)"
+    else
+        RANDOM_PART="$("$OD_BIN" -An -N16 -tx1 /dev/urandom 2>/dev/null || true)"
+    fi
+fi
+
+if [ -z "$RANDOM_PART" ]; then
+    RANDOM_PART="${TIMESTAMP}-${PPID:-0}-$$"
+fi
+
+INSTALL_ID="install-${TIMESTAMP}-${RANDOM_PART}"
+WRITE_OK=0
+FAILURES=""
+
+append_failure() {
+    failure="$1"
+
+    if [ -z "$FAILURES" ]; then
+        FAILURES="$failure"
+    else
+        FAILURES="${FAILURES},${failure}"
+    fi
+}
+
+if [ -z "$DEFAULTS_BIN" ]; then
+    append_failure "defaults-not-found"
+else
+    if [ -n "$SU_BIN" ]; then
+        COMMAND="'$DEFAULTS_BIN' write '$PREFS_DOMAIN' '$INSTALL_ID_KEY' -string '$INSTALL_ID'"
+
+        if "$SU_BIN" mobile -c "$COMMAND" >/dev/null 2>&1; then
+            WRITE_OK=1
+        else
+            STATUS=$?
+            append_failure "su-mobile-defaults-exit-${STATUS}"
+        fi
+    else
+        append_failure "su-not-found"
+    fi
+
+    if [ "$WRITE_OK" -eq 0 ]; then
+        if HOME=/var/mobile USER=mobile LOGNAME=mobile \
+            "$DEFAULTS_BIN" write "$PREFS_DOMAIN" "$INSTALL_ID_KEY" \
+            -string "$INSTALL_ID" >/dev/null 2>&1; then
+            WRITE_OK=1
+        else
+            STATUS=$?
+            append_failure "direct-defaults-exit-${STATUS}"
+        fi
+    fi
+fi
+
+if [ "$WRITE_OK" -eq 1 ]; then
+    if [ -f "$PREFS_FILE" ] && [ -n "$CHOWN_BIN" ]; then
+        "$CHOWN_BIN" mobile:mobile "$PREFS_FILE" >/dev/null 2>&1 || true
+    fi
+
+    exit 0
+fi
+
+DEFAULTS_INFO="${DEFAULTS_BIN:-missing}"
+SU_INFO="${SU_BIN:-missing}"
+
+echo "SpeakNotification16: install marker not written; continuing (reasons=${FAILURES:-unknown}; defaults=${DEFAULTS_INFO}; su=${SU_INFO})" >&2
+
+exit 0
