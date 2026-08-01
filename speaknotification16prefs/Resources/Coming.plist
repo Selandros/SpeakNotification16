@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Coming</string>
+            <key>footerText</key>
+            <string>These features are planned or still being tested. They are shown here for visibility, but they do not work yet.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Speak when unlocked</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>speakWhenUnlocked</string>
+            <key>default</key><false/>
+            <key>enabled</key><false/>
+        </dict>
+
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Quiet Hours</string>
+            <key>footerText</key>
+            <string>Planned quiet-hours schedule. Disabled for now.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Enable quiet hours</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>enableQuietHours</string>
+            <key>default</key><false/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSEditTextCell</string>
+            <key>label</key><string>Start time</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>quietStart</string>
+            <key>placeholder</key><string>22:00</string>
+            <key>noAutoCorrect</key><true/>
+            <key>noAutoCaps</key><true/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSEditTextCell</string>
+            <key>label</key><string>End time</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>quietEnd</string>
+            <key>placeholder</key><string>07:00</string>
+            <key>noAutoCorrect</key><true/>
+            <key>noAutoCaps</key><true/>
+            <key>enabled</key><false/>
+        </dict>
+
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Lock Screen Privacy</string>
+            <key>footerText</key>
+            <string>Planned lock-screen privacy mode. Disabled for now.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Hide message on lock screen</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>lockscreenPrivacy</string>
+            <key>default</key><false/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Bluetooth mono audio</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>bluetoothMonoAudio</string>
+            <key>default</key><false/>
+            <key>enabled</key><false/>
+        </dict>
+
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Speech rate</string>
+            <key>footerText</key>
+            <string>Planned speech speed control. Disabled for now.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSliderCell</string>
+            <key>label</key><string></string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>speechRate</string>
+            <key>default</key><real>1.0</real>
+            <key>min</key><real>1.0</real>
+            <key>max</key><real>2.0</real>
+            <key>showValue</key><true/>
+            <key>enabled</key><false/>
+        </dict>
+
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Filter</string>
+            <key>footerText</key>
+            <string>Planned word filter for notification text. Disabled for now.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSEditTextCell</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>filterWords</string>
+            <key>placeholder</key><string>Text</string>
+            <key>noAutoCorrect</key><true/>
+            <key>noAutoCaps</key><true/>
+            <key>enabled</key><false/>
+        </dict>
+
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Calls</string>
+            <key>footerText</key>
+            <string>Call announcements are not active yet.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Read incoming calls</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>readIncomingCalls</string>
+            <key>default</key><false/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSEditTextCell</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>incomingCallText</string>
+            <key>id</key><string>incomingText</string>
+            <key>default</key><string>Incoming call from</string>
+            <key>noAutoCorrect</key><true/>
+            <key>noAutoCaps</key><true/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Read missed calls</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>readMissedCalls</string>
+            <key>default</key><false/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSEditTextCell</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>missedCallText</string>
+            <key>id</key><string>missedText</string>
+            <key>default</key><string>Missed call from</string>
+            <key>noAutoCorrect</key><true/>
+            <key>noAutoCaps</key><true/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Speak call duration</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>speakCallDuration</string>
+            <key>default</key><false/>
+            <key>enabled</key><false/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSEditTextCell</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>callDurationText</string>
+            <key>id</key><string>durationText</string>
+            <key>default</key><string>Talk time</string>
+            <key>noAutoCorrect</key><true/>
+            <key>noAutoCaps</key><true/>
+            <key>enabled</key><false/>
+        </dict>
+
+    </array>
+</dict>
+</plist>

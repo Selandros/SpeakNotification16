@@ -1,0 +1,14 @@
+.theos/
+packages/
+logs/
+*.deb
+*.backup.deb
+*.dSYM
+.DS_Store
+*.log
+build/
+obj/
+*.zip
+__MACOSX/
+AGENTS.md
+speaknotification16prefs/Resources/speaknotification16 (kopia).png
