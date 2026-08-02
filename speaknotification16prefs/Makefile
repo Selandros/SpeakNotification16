@@ -17,10 +17,12 @@ SpeakNotification16Prefs_FILES = ../SNSharedKeys.m \
     Sources/BtListController.m \
     Sources/SNAppListProvider.m \
     Sources/LanguagesListController.m \
+    Sources/SNLanguageVoiceListController.m \
+    Sources/SNLanguageVoiceController.m \
     Sources/SNComingListController.m
 
 SpeakNotification16Prefs_INSTALL_PATH = /Library/PreferenceBundles
-SpeakNotification16Prefs_FRAMEWORKS = UIKit
+SpeakNotification16Prefs_FRAMEWORKS = UIKit AVFoundation
 SpeakNotification16Prefs_PRIVATE_FRAMEWORKS = Preferences
 SpeakNotification16Prefs_RESOURCE_FILES = Resources/Root.plist Resources/Coming.plist
 

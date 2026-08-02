@@ -15,6 +15,7 @@ FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoLang;
 FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoVoiceName;
 FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoVoiceIdentifier;
 FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoVoiceSource;
+FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoVoiceQuality;
 FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoTerminalReason;
 FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoTransaction;
 

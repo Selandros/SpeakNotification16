@@ -26,7 +26,7 @@ It reads incoming notifications aloud using system TTS and keeps the focus on st
 Install the `.deb` with your package manager or over SSH:
 
 ```sh
-dpkg -i com.selandros.speaknotification16_2.0.0_iphoneos-arm64.deb
+dpkg -i com.selandros.speaknotification16_2.1.0_iphoneos-arm64.deb
 ```
 
 Then respring SpringBoard.

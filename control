@@ -1,7 +1,7 @@
 Package: com.selandros.speaknotification16
 Name: SpeakNotification16
 Architecture: iphoneos-arm64
-Version: 2.0.0
+Version: 2.1.0
 Description: Rootless iOS 16 rebuild of the original SpeakNotification tweak created by Merdok. Reads incoming notifications using system TTS.
 Maintainer: Selandros
 Author: Selandros

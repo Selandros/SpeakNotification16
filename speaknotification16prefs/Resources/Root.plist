@@ -200,6 +200,11 @@
             <key>default</key><false/>
             <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
         </dict>
+        <dict>
+            <key>cell</key><string>PSLinkCell</string>
+            <key>label</key><string>Languages &amp; Voices</string>
+            <key>detail</key><string>SNLanguageVoiceListController</string>
+        </dict>
         <!-- MESSAGE FORMAT -->
         <dict>
             <key>cell</key><string>PSGroupCell</string>

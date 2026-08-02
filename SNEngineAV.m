@@ -4,8 +4,10 @@
 
 #import "SNEngineAV.h"
 #import <AVFoundation/AVFoundation.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
 #import "SNCancellation.h"
+#import "SNSharedKeys.h"
 #import <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -20,6 +22,7 @@ NSString * const kSNEngineAVUserInfoLang = @"lang";
 NSString * const kSNEngineAVUserInfoVoiceName = @"voiceName";
 NSString * const kSNEngineAVUserInfoVoiceIdentifier = @"voiceIdentifier";
 NSString * const kSNEngineAVUserInfoVoiceSource = @"voiceSource";
+NSString * const kSNEngineAVUserInfoVoiceQuality = @"voiceQuality";
 NSString * const kSNEngineAVUserInfoTerminalReason = @"terminalReason";
 NSString * const kSNEngineAVUserInfoTransaction = @"transaction";
 
@@ -199,14 +202,6 @@ static _Atomic BOOL sSpeaking = NO;                    // speaking flag
 static _Atomic uint64_t sActiveTransaction = 0;         // active outer transaction
 static _Atomic uint64_t sLegacyTransactionSequence = 1; // non-zero IDs for legacy callers
 static dispatch_source_t sSpeakTimeout = nil;          // fallback timer
-static NSMutableDictionary<NSString *, NSString *> *sVoiceIdentifierCache;
-static NSString *sResolvedEnglishPreferredIdentifier = nil;
-static NSString *sResolvedEnglishPreferredSource = nil;
-
-static inline BOOL SNLangIsEnglish(NSString *lang)
-{
-    return [lang isKindOfClass:NSString.class] && [lang hasPrefix:@"en"];
-}
 
 static char kSNUtteranceTransactionKey;
 
@@ -226,70 +221,69 @@ static inline void SNPostTerminalWakeup(NSString *reason, uint64_t txn)
                                                       }];
 }
 
-static inline NSString *SNResolvedEnglishPreferredIdentifier(void)
+static NSString *SNNormalizedVoiceLanguage(NSString *language)
 {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *bestIdentifier = nil;
-        NSString *bestSource = nil;
-        AVSpeechSynthesisVoice *compactFallback = nil;
-
-        @try {
-            for (AVSpeechSynthesisVoice *voice in [AVSpeechSynthesisVoice speechVoices]) {
-                if (![voice.language isEqualToString:@"en-US"]) continue;
-                if ([voice.name rangeOfString:@"Samantha" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
-
-                if ([voice.identifier isEqualToString:@"com.apple.voice.compact.en-US.Samantha"]) {
-                    compactFallback = voice;
-                    if (!bestIdentifier) {
-                        bestIdentifier = voice.identifier;
-                        bestSource = @"fixed-compact-fallback";
-                    }
-                    continue;
-                }
-
-                BOOL isEnhanced = NO;
-                @try {
-                    isEnhanced = (voice.quality == AVSpeechSynthesisVoiceQualityEnhanced);
-                } @catch (__unused id e) {
-                    isEnhanced = NO;
-                }
-
-                if (isEnhanced) {
-                    bestIdentifier = voice.identifier;
-                    bestSource = @"fixed-enhanced";
-                    break;
-                }
-
-                if (!bestIdentifier) {
-                    bestIdentifier = voice.identifier;
-                    bestSource = @"fixed-compact-fallback";
-                }
-            }
-        } @catch (__unused id e) {
-            bestIdentifier = nil;
-            bestSource = nil;
-        }
-
-        if (!bestIdentifier && compactFallback.identifier.length) {
-            bestIdentifier = compactFallback.identifier;
-            bestSource = @"fixed-compact-fallback";
-        }
-
-        sResolvedEnglishPreferredIdentifier = [bestIdentifier copy];
-        sResolvedEnglishPreferredSource = [bestSource copy];
-        if (!sResolvedEnglishPreferredIdentifier.length) {
-            sResolvedEnglishPreferredIdentifier = @"com.apple.voice.compact.en-US.Samantha";
-            sResolvedEnglishPreferredSource = @"fixed-compact-fallback";
-        }
-    });
-    return sResolvedEnglishPreferredIdentifier;
+    if (![language isKindOfClass:NSString.class] || language.length == 0) return @"";
+    return SNNormalizeVoiceLanguage(language);
 }
 
-static inline NSString *SNResolvedEnglishPreferredSource(void)
+static NSString *SNSelectedVoiceIdentifierForLanguage(NSString *language)
 {
-    (void)SNResolvedEnglishPreferredIdentifier();
-    return sResolvedEnglishPreferredSource;
+    if (language.length == 0) return nil;
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+    NSDictionary *byLanguage = [defaults dictionaryForKey:kSNSelectedVoiceIdentifierByLanguageKey];
+    id value = [byLanguage objectForKey:language];
+    NSString *identifier = [value isKindOfClass:NSString.class] && [(NSString *)value length] ? [value copy] : nil;
+    [defaults release];
+    return [identifier autorelease];
+}
+
+static AVSpeechSynthesisVoice *SNExposedVoiceWithIdentifierForLanguage(NSString *identifier,
+                                                                        NSString *language)
+{
+    if (identifier.length == 0 || language.length == 0) return nil;
+    for (AVSpeechSynthesisVoice *candidate in [AVSpeechSynthesisVoice speechVoices]) {
+        if (![candidate.identifier isEqualToString:identifier]) continue;
+        if (![SNNormalizedVoiceLanguage(candidate.language) isEqualToString:language]) return nil;
+        AVSpeechSynthesisVoice *resolved = [AVSpeechSynthesisVoice voiceWithIdentifier:identifier];
+        if (![SNNormalizedVoiceLanguage(resolved.language) isEqualToString:language]) return nil;
+        return resolved;
+    }
+    return nil;
+}
+
+static void SNRecordVoiceAttempt(NSString *language,
+                                 AVSpeechSynthesisVoice *voice,
+                                 NSString *source)
+{
+    if (language.length == 0) return;
+
+    AVSpeechSynthesisVoice *compatibleVoice = SNExposedVoiceWithIdentifierForLanguage(voice.identifier, language);
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+    NSDictionary *stored = [defaults dictionaryForKey:kSNLastUsedVoiceByLanguageKey];
+    NSMutableDictionary *byLanguage = [stored isKindOfClass:NSDictionary.class] ? [stored mutableCopy] : [[NSMutableDictionary alloc] init];
+    NSDictionary *previous = [[byLanguage objectForKey:language] isKindOfClass:NSDictionary.class] ? [byLanguage objectForKey:language] : nil;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSString *status = compatibleVoice ? @"available" : @"unavailable";
+    NSMutableDictionary *entry = [previous isKindOfClass:NSDictionary.class] ? [previous mutableCopy] : [[NSMutableDictionary alloc] init];
+    [entry setObject:status forKey:@"status"];
+    [entry setObject:@(now) forKey:@"lastAttemptAt"];
+    if (compatibleVoice) {
+        NSInteger quality = 0;
+        @try { quality = compatibleVoice.quality; } @catch (__unused id e) {}
+        [entry setObject:(compatibleVoice.name ?: @"") forKey:@"voiceName"];
+        [entry setObject:compatibleVoice.identifier forKey:@"voiceIdentifier"];
+        [entry setObject:@(quality) forKey:@"voiceQuality"];
+        [entry setObject:(source ?: @"") forKey:@"voiceSource"];
+        [entry setObject:@(now) forKey:@"lastUsedAt"];
+    }
+    [byLanguage setObject:entry forKey:language];
+    [entry release];
+    [defaults setObject:byLanguage forKey:kSNLastUsedVoiceByLanguageKey];
+    [defaults synchronize];
+    [byLanguage release];
+    [defaults release];
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), kSNVoiceStateChangedNotify, NULL, NULL, true);
 }
 
 @implementation SNEngineAV
@@ -316,9 +310,6 @@ static inline NSString *SNResolvedEnglishPreferredSource(void)
         _snSerialQ = dispatch_queue_create("sn.tts.serial", DISPATCH_QUEUE_SERIAL);
         if (!sTTSQueue) {
             sTTSQueue = [NSMutableArray new];
-        }
-        if (!sVoiceIdentifierCache) {
-            sVoiceIdentifierCache = [NSMutableDictionary new];
         }
     }
     return self;
@@ -760,66 +751,58 @@ static inline NSString *SNResolvedEnglishPreferredSource(void)
             AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:it.text];
             objc_setAssociatedObject(u, &kSNUtteranceTransactionKey, @(it.transaction), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+            // Voice preferences must never influence detected language.
+            NSString *voiceLanguage = SNNormalizedVoiceLanguage(it.lang);
             AVSpeechSynthesisVoice *v = nil;
-            BOOL isEnglish = SNLangIsEnglish(it.lang);
-            NSString *voiceSource = @"fallback";
-            if (it.lang.length) {
+            NSString *voiceSource = @"systemDefault";
+            NSString *selectedIdentifier = SNSelectedVoiceIdentifierForLanguage(voiceLanguage);
+            BOOL selectedVoiceMissing = NO;
+            if (voiceLanguage.length) {
                 @try {
-                    if (isEnglish) {
-                        NSString *preferredIdentifier = SNResolvedEnglishPreferredIdentifier();
-                        if (preferredIdentifier.length) {
-                            v = [AVSpeechSynthesisVoice voiceWithIdentifier:preferredIdentifier];
-                            if (v) {
-                                voiceSource = SNResolvedEnglishPreferredSource() ?: @"fixed-enhanced";
-                            }
-                        }
-                        if (!v) {
-                            v = [AVSpeechSynthesisVoice voiceWithIdentifier:@"com.apple.voice.compact.en-US.Samantha"];
-                            if (v) {
-                                voiceSource = @"fixed-compact-fallback";
-                            }
+                    if (selectedIdentifier.length) {
+                        AVSpeechSynthesisVoice *selected = SNExposedVoiceWithIdentifierForLanguage(selectedIdentifier, voiceLanguage);
+                        if (selected) {
+                            v = selected;
+                            voiceSource = @"userSelected";
+                        } else {
+                            selectedVoiceMissing = YES;
                         }
                     }
                     if (!v) {
-                        NSString *cachedIdentifier = [sVoiceIdentifierCache objectForKey:it.lang];
-                        if (cachedIdentifier.length) {
-                            v = [AVSpeechSynthesisVoice voiceWithIdentifier:cachedIdentifier];
-                            if (v) {
-                                voiceSource = @"cache";
-                            }
-                        }
-                    }
-                    if (!v) {
-                        v = [AVSpeechSynthesisVoice voiceWithLanguage:it.lang];
-                        NSString *resolvedIdentifier = v.identifier;
-                        if (resolvedIdentifier.length) {
-                            [sVoiceIdentifierCache setObject:resolvedIdentifier forKey:it.lang];
-                        }
+                        v = [AVSpeechSynthesisVoice voiceWithLanguage:voiceLanguage];
                         if (v) {
-                            voiceSource = @"fallback";
+                            BOOL exactLanguage = [SNNormalizedVoiceLanguage(v.language) isEqualToString:voiceLanguage];
+                            voiceSource = selectedVoiceMissing ? @"missingSelectedVoice" : (exactLanguage ? @"systemDefault" : @"languageFallback");
                         }
+                    }
+                    if (!v && [voiceLanguage hasPrefix:@"en-"]) {
+                        v = [AVSpeechSynthesisVoice voiceWithIdentifier:@"com.apple.voice.compact.en-US.Samantha"];
+                        if (v) voiceSource = @"legacyFallback";
                     }
                 } @catch (__unused id e) {
                     v = nil;
                 }
             }
+            NSDictionary *voiceInfo = nil;
             if (v) {
                 u.voice = v;
-                NSDictionary *info = @{
-                    kSNEngineAVUserInfoLang: (it.lang ?: @""),
+                NSInteger quality = 0;
+                @try { quality = v.quality; } @catch (__unused id e) {}
+                voiceInfo = @{
+                    kSNEngineAVUserInfoLang: voiceLanguage,
                     kSNEngineAVUserInfoVoiceName: (v.name ?: @""),
                     kSNEngineAVUserInfoVoiceIdentifier: (v.identifier ?: @""),
-                    kSNEngineAVUserInfoVoiceSource: voiceSource
+                    kSNEngineAVUserInfoVoiceSource: voiceSource,
+                    kSNEngineAVUserInfoVoiceQuality: @(quality)
                 };
-                [[NSNotificationCenter defaultCenter] postNotificationName:kSNEngineAVDidSelectVoice object:nil userInfo:info];
             } else {
-                NSDictionary *info = @{
-                    kSNEngineAVUserInfoLang: (it.lang ?: @""),
+                voiceInfo = @{
+                    kSNEngineAVUserInfoLang: voiceLanguage,
                     kSNEngineAVUserInfoVoiceName: @"-",
                     kSNEngineAVUserInfoVoiceIdentifier: @"-",
-                    kSNEngineAVUserInfoVoiceSource: @"unavailable"
+                    kSNEngineAVUserInfoVoiceSource: @"unavailable",
+                    kSNEngineAVUserInfoVoiceQuality: @0
                 };
-                [[NSNotificationCenter defaultCenter] postNotificationName:kSNEngineAVDidSelectVoice object:nil userInfo:info];
             }
             u.rate = AVSpeechUtteranceDefaultSpeechRate;
 
@@ -832,6 +815,8 @@ static inline NSString *SNResolvedEnglishPreferredSource(void)
             });
 
             [me.synth speakUtterance:u];
+            SNRecordVoiceAttempt(voiceLanguage, v, voiceSource);
+            [[NSNotificationCenter defaultCenter] postNotificationName:kSNEngineAVDidSelectVoice object:nil userInfo:voiceInfo];
         }
     });
     [it release];
