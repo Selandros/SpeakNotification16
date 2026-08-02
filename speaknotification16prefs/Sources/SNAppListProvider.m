@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import "SNSharedKeys.h"
 
@@ -11,9 +12,45 @@ static NSString * const kAppsCacheKey = @"cachedVisibleApps_v7";           // Ne
 
 @interface LSApplicationProxy : NSObject
 + (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
-@property (nonatomic, readonly) NSString *applicationIdentifier;  // bundleID
-@property (nonatomic, readonly) NSString *localizedName;
 @end
+
+static id SN_ProxyValueForSelector(id proxy, SEL selector)
+{
+    if (!proxy || !selector || ![proxy respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(proxy, selector);
+}
+
+static NSString *SN_ProxyStringForSelector(id proxy, SEL selector)
+{
+    id value = SN_ProxyValueForSelector(proxy, selector);
+    return [value isKindOfClass:NSString.class] ? value : nil;
+}
+
+static NSURL *SN_ProxyURLForSelector(id proxy, SEL selector)
+{
+    id value = SN_ProxyValueForSelector(proxy, selector);
+    return [value isKindOfClass:NSURL.class] ? value : nil;
+}
+
+static BOOL SN_ProxyBooleanSelectorIsFalse(id proxy, SEL selector)
+{
+    if (!proxy || !selector || ![proxy respondsToSelector:selector]) return NO;
+    return !((BOOL (*)(id, SEL))objc_msgSend)(proxy, selector);
+}
+
+static BOOL SN_ProxyOptionalBooleanSelectorIsFalse(id proxy, SEL selector)
+{
+    if (!proxy || !selector || ![proxy respondsToSelector:selector]) return YES;
+    return !((BOOL (*)(id, SEL))objc_msgSend)(proxy, selector);
+}
+
+static id SN_ApplicationProxyForIdentifier(NSString *identifier)
+{
+    Class proxyClass = objc_getClass("LSApplicationProxy");
+    SEL selector = @selector(applicationProxyForIdentifier:);
+    if (!proxyClass || ![proxyClass respondsToSelector:selector] || identifier.length == 0) return nil;
+    return ((id (*)(id, SEL, id))objc_msgSend)(proxyClass, selector, identifier);
+}
 
 // Apple whitelist (edit here to add more Apple apps)
 static inline NSSet<NSString *> *SN_StaticAppleWhitelist(void) {
@@ -50,36 +87,27 @@ static inline NSSet<NSString *> *SN_StaticAppleWhitelist(void) {
     return wl;
 }
 
-// Loose guard: works in Preferences (no bundleURL required)
 static inline BOOL SN_IsNotPlaceholderWatchOrClip(id proxy) {
-    @try {
-        NSNumber *placeholder = nil; @try { placeholder = [proxy valueForKey:@"isPlaceholder"]; } @catch (...) {}
-        if ([placeholder isKindOfClass:NSNumber.class] && placeholder.boolValue) return NO;
-
-        NSNumber *isWatch = nil; @try { isWatch = [proxy valueForKey:@"isWatchKitApp"]; } @catch (...) {}
-        if ([isWatch isKindOfClass:NSNumber.class] && isWatch.boolValue) return NO;
-
-        NSNumber *isClip = nil; @try { isClip = [proxy valueForKey:@"isAppClip"]; } @catch (...) {}
-        if ([isClip isKindOfClass:NSNumber.class] && isClip.boolValue) return NO;
-
-        NSNumber *removed = nil; @try { removed = [proxy valueForKey:@"isRemovedSystemApp"]; } @catch (...) {}
-        if ([removed isKindOfClass:NSNumber.class] && removed.boolValue) return NO;
-
-        return YES;
-    } @catch (...) {
-        return NO;
-    }
+    return SN_ProxyBooleanSelectorIsFalse(proxy, @selector(isPlaceholder)) &&
+           SN_ProxyBooleanSelectorIsFalse(proxy, @selector(isWatchKitApp)) &&
+           SN_ProxyBooleanSelectorIsFalse(proxy, @selector(isRemovedSystemApp)) &&
+           SN_ProxyOptionalBooleanSelectorIsFalse(proxy, NSSelectorFromString(@"isAppClip"));
 }
 
-// Third-party: require applicationType == "User" (no bundleURL requirement)
-static inline BOOL SN_IsThirdPartyUserApp(id proxy, NSString *bundle) {
+static inline BOOL SN_IsVisibleThirdPartyApp(id proxy, NSString *bundle, NSString *name) {
     if (bundle.length == 0) return NO;
     if ([bundle hasPrefix:@"com.apple."]) return NO;
-    @try {
-        NSString *type = [proxy valueForKey:@"applicationType"]; // "User"/"System"/"Internal"
-        if (![type isKindOfClass:NSString.class] || ![type isEqualToString:@"User"]) return NO;
-    } @catch (...) { return NO; }
-    return SN_IsNotPlaceholderWatchOrClip(proxy);
+    if (name.length == 0) return NO;
+
+    NSURL *bundleURL = SN_ProxyURLForSelector(proxy, @selector(bundleURL));
+    if (!bundleURL.isFileURL || ![[bundleURL pathExtension] isEqualToString:@"app"]) return NO;
+
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:bundleURL.path isDirectory:&isDirectory] || !isDirectory) return NO;
+
+    return SN_IsNotPlaceholderWatchOrClip(proxy) &&
+           SN_ProxyBooleanSelectorIsFalse(proxy, @selector(isRestricted)) &&
+           SN_ProxyBooleanSelectorIsFalse(proxy, @selector(isLaunchProhibited));
 }
 
 // Apple whitelist: allow even if bundleURL missing in Prefs
@@ -92,20 +120,23 @@ static inline BOOL SN_IsWhitelistedAppleApp(id proxy, NSString *bundle) {
 
 // Build full list: third-party first, then Apple whitelist explicitly
 static NSArray<NSDictionary *> *SN_BuildVisibleApps(void) {
-    id ws = [objc_getClass("LSApplicationWorkspace") defaultWorkspace];
-    NSArray *all = ([ws respondsToSelector:@selector(allApplications)]) ? [ws allApplications] : @[];
+    Class workspaceClass = objc_getClass("LSApplicationWorkspace");
+    SEL defaultWorkspace = @selector(defaultWorkspace);
+    id ws = (workspaceClass && [workspaceClass respondsToSelector:defaultWorkspace])
+        ? ((id (*)(id, SEL))objc_msgSend)(workspaceClass, defaultWorkspace) : nil;
+    NSArray *all = ([ws respondsToSelector:@selector(allApplications)])
+        ? ((id (*)(id, SEL))objc_msgSend)(ws, @selector(allApplications)) : @[];
 
     NSMutableArray<NSDictionary *> *out = [NSMutableArray arrayWithCapacity:all.count];
     NSMutableSet<NSString *> *added = [NSMutableSet set];
 
     // Third-party apps
     for (id p in all) {
-        NSString *bundle = nil;
-        NSString *name   = nil;
-        @try { bundle = [p valueForKey:@"applicationIdentifier"]; } @catch (...) {}
-        @try { name   = [p valueForKey:@"localizedName"]; } @catch (...) {}
+        NSString *bundle = SN_ProxyStringForSelector(p, @selector(bundleIdentifier));
+        if (bundle.length == 0) bundle = SN_ProxyStringForSelector(p, @selector(applicationIdentifier));
+        NSString *name = SN_ProxyStringForSelector(p, @selector(localizedName));
         if (bundle.length == 0 || name.length == 0) continue;
-        if (!SN_IsThirdPartyUserApp(p, bundle)) continue;
+        if (!SN_IsVisibleThirdPartyApp(p, bundle, name)) continue;
         [out addObject:@{ @"name": name, @"bundle": bundle }];
         [added addObject:bundle];
     }
@@ -113,12 +144,11 @@ static NSArray<NSDictionary *> *SN_BuildVisibleApps(void) {
     // Whitelisted Apple apps explicitly via LSApplicationProxy
     for (NSString *bid in SN_StaticAppleWhitelist()) {
         if ([added containsObject:bid]) continue;
-        id proxy = [objc_getClass("LSApplicationProxy") applicationProxyForIdentifier:bid];
+        id proxy = SN_ApplicationProxyForIdentifier(bid);
         if (!proxy) continue;
         if (!SN_IsWhitelistedAppleApp(proxy, bid)) continue;
 
-        NSString *name = nil;
-        @try { name = [proxy localizedName]; } @catch (...) {}
+        NSString *name = SN_ProxyStringForSelector(proxy, @selector(localizedName));
         if (name.length == 0) name = bid;
 
         [out addObject:@{ @"name": name, @"bundle": bid }];

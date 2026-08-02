@@ -4410,7 +4410,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.0";
+static NSString * const kReleaseInstalledVersion = @"2.1.1";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
