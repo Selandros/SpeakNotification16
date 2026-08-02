@@ -979,6 +979,13 @@ static NSString *sn_detect_language_nl(NSString *sample,
     return finalLanguage;
 }
 
+static NSString *sn_voice_quality_label(NSInteger quality)
+{
+    if (quality == AVSpeechSynthesisVoiceQualityPremium) return @"premium";
+    if (quality == AVSpeechSynthesisVoiceQualityEnhanced) return @"enhanced";
+    return @"compact";
+}
+
 
 #pragma mark - Trust / Policy Gates
 
@@ -4403,8 +4410,9 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.0.0";
-static NSString * const kReleaseExactAssetName = @"com.selandros.speaknotification16_2.0.0_iphoneos-arm64.deb";
+static NSString * const kReleaseInstalledVersion = @"2.1.0";
+static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
+static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
 static NSString * const kReleaseBulletinPrefix = @"SpeakNotification16ReleaseAlert.";
 static NSString * const kReleaseBulletinCategory = @"SpeakNotification16ReleaseAlert";
@@ -4564,33 +4572,66 @@ static NSString *sn_release_asset_timestamp(NSDictionary *asset)
     return createdAt.length > 0 ? createdAt : nil;
 }
 
-static BOOL sn_release_asset_name_matches(NSString *name)
+static NSString *sn_release_version_from_tag(NSString *tag)
 {
-    if (![name isKindOfClass:NSString.class]) return NO;
-    if ([name isEqualToString:kReleaseExactAssetName]) return YES;
-    return [name hasPrefix:@"com.selandros.speaknotification16_"] &&
-           [name hasSuffix:@"_iphoneos-arm64.deb"];
+    if (![tag isKindOfClass:NSString.class]) return nil;
+    NSString *value = [tag stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([value hasPrefix:@"v"] || [value hasPrefix:@"V"]) value = [value substringFromIndex:1];
+    NSArray<NSString *> *parts = [value componentsSeparatedByString:@"."];
+    if (parts.count != 3) return nil;
+    for (NSString *part in parts) {
+        if (part.length == 0 || (part.length > 1 && [part hasPrefix:@"0"])) return nil;
+        if ([[part stringByTrimmingCharactersInSet:NSCharacterSet.decimalDigitCharacterSet] length] != 0) return nil;
+    }
+    return value;
 }
 
-static NSDictionary *sn_release_matching_asset(NSArray *assets)
+static BOOL sn_release_compare_versions(NSString *left,
+                                        NSString *right,
+                                        NSComparisonResult *result)
+{
+    NSArray<NSString *> *leftParts = [left componentsSeparatedByString:@"."];
+    NSArray<NSString *> *rightParts = [right componentsSeparatedByString:@"."];
+    if (leftParts.count != 3 || rightParts.count != 3) return NO;
+    for (NSUInteger index = 0; index < 3; index++) {
+        long long leftValue = [leftParts[index] longLongValue];
+        long long rightValue = [rightParts[index] longLongValue];
+        if (leftValue < rightValue) {
+            if (result) *result = NSOrderedAscending;
+            return YES;
+        }
+        if (leftValue > rightValue) {
+            if (result) *result = NSOrderedDescending;
+            return YES;
+        }
+    }
+    if (result) *result = NSOrderedSame;
+    return YES;
+}
+
+static NSString *sn_release_expected_asset_name(NSString *releaseVersion)
+{
+    if (releaseVersion.length == 0) return nil;
+    return [NSString stringWithFormat:@"%@%@%@",
+            kReleaseAssetPrefix, releaseVersion, kReleaseAssetSuffix];
+}
+
+static NSDictionary *sn_release_matching_asset(NSArray *assets, NSString *releaseVersion)
 {
     if (![assets isKindOfClass:NSArray.class]) return nil;
-    NSDictionary *fallback = nil;
-    NSString *fallbackTimestamp = nil;
+    NSString *expectedName = sn_release_expected_asset_name(releaseVersion);
+    if (expectedName.length == 0) return nil;
+    NSDictionary *match = nil;
     for (id item in assets) {
         if (![item isKindOfClass:NSDictionary.class]) continue;
         NSDictionary *asset = (NSDictionary *)item;
         NSString *name = [asset[@"name"] isKindOfClass:NSString.class] ? asset[@"name"] : nil;
-        if ([name isEqualToString:kReleaseExactAssetName]) return asset;
-        if (!sn_release_asset_name_matches(name)) continue;
-        NSString *timestamp = sn_release_asset_timestamp(asset);
-        if (!fallback ||
-            (timestamp.length > 0 && [timestamp compare:(fallbackTimestamp ?: @"")] == NSOrderedDescending)) {
-            fallback = asset;
-            fallbackTimestamp = timestamp;
-        }
+        if (![name hasPrefix:kReleaseAssetPrefix] || ![name hasSuffix:kReleaseAssetSuffix]) continue;
+        if (![name isEqualToString:expectedName]) continue;
+        if (match) return nil;
+        match = asset;
     }
-    return fallback;
+    return match;
 }
 
 static uint64_t sn_release_build_hash(NSString *buildID)
@@ -5906,7 +5947,8 @@ static void sn_release_process_response_locked(NSData *data,
             return;
         }
 
-        NSDictionary *asset = sn_release_matching_asset(assets);
+        NSString *releaseVersion = sn_release_version_from_tag(tag);
+        NSDictionary *asset = sn_release_matching_asset(assets, releaseVersion);
         NSString *assetName = [asset[@"name"] isKindOfClass:NSString.class]
             ? asset[@"name"] : nil;
         NSString *updatedAt = sn_release_asset_timestamp(asset);
@@ -5938,6 +5980,28 @@ static void sn_release_process_response_locked(NSData *data,
         [defs synchronize];
         RELEASE_LOG(@"[RELEASE] latest | tag=%@ asset=%@ updatedAt=%@ buildID=%@ draft=0 prerelease=0",
                     tag, assetName, updatedAt, buildID);
+
+        NSComparisonResult versionOrder = NSOrderedSame;
+        if (!sn_release_compare_versions(releaseVersion, kReleaseInstalledVersion, &versionOrder)) {
+            if (installBaseline) {
+                sn_release_complete_install_cycle_locked(defs, status, @"invalidReleaseVersion");
+            } else {
+                sn_release_save_completion_locked(status, @"invalidReleaseVersion", kReleaseNormalInterval);
+            }
+            sn_release_post_manual_result_locked(manualRequestID, @"invalidResponse", tag, htmlURLString, nil);
+            return;
+        }
+        if (versionOrder == NSOrderedAscending) {
+            RELEASE_LOG(@"[RELEASE] notify skip | reason=noNewerVersion installed=%@ remote=%@",
+                        kReleaseInstalledVersion, releaseVersion);
+            if (installBaseline) {
+                sn_release_complete_install_cycle_locked(defs, status, nil);
+            } else {
+                sn_release_save_completion_locked(status, nil, kReleaseNormalInterval);
+            }
+            sn_release_post_manual_result_locked(manualRequestID, @"upToDate", tag, htmlURLString, nil);
+            return;
+        }
 
         if (installBaseline) {
             sn_release_save_install_baseline_locked(defs,
@@ -6958,11 +7022,13 @@ static inline BOOL sn_is_carplay_host_process(void)
         NSString *name = ui[kSNEngineAVUserInfoVoiceName] ?: @"-";
         NSString *identifier = ui[kSNEngineAVUserInfoVoiceIdentifier] ?: @"-";
         NSString *source = ui[kSNEngineAVUserInfoVoiceSource] ?: @"-";
+        NSInteger quality = [ui[kSNEngineAVUserInfoVoiceQuality] integerValue];
         BOOL unavailable = [source isEqualToString:@"unavailable"] || [identifier isEqualToString:@"-"];
         if (unavailable) {
             SNLOGFMT(@"[VOICE] unavailable | lang=%@", lang);
-        } else if (DBG_LANG_VERBOSE_ON) {
-            SNLOGFMT(@"[VOICE] lang=%@ name=%@ id=%@ source=%@", lang, name, identifier, source);
+        } else if (gDebugLogs || DBG_LANG_VERBOSE_ON) {
+            SNLOGFMT(@"[VOICE] lang=%@ name=%@ quality=%@ source=%@ identifier=%@",
+                     lang, name, sn_voice_quality_label(quality), source, identifier);
         }
     }];
 
