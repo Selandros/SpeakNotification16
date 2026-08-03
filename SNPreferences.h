@@ -58,9 +58,10 @@ extern NSString * const kKeyInterruptionTailMs;   // INT 0–2000 (milliseconds)
 - (SNCancelButtonMode)cancelButtonMode;
 
 // ===== Trusted environment lists =====
-// Arrays of allowed SSIDs and Bluetooth devices; used to gate TTS playback.
+// Arrays of allowed SSIDs, Bluetooth devices, and wired audio devices; used to gate TTS playback.
 @property (atomic, copy, readonly) NSArray<NSString *> *trustedSSIDs;
 @property (atomic, copy, readonly) NSArray<NSString *> *trustedBTDevices;
+@property (atomic, copy, readonly) NSArray<NSString *> *trustedWiredAudioDevices;
 
 // ===== Optional message format (global fallback; per-app handled elsewhere) =====
 @property (atomic, copy, readonly) NSString *messageFormat;
@@ -92,6 +93,7 @@ extern NSString * const kKeyInterruptionTailMs;   // INT 0–2000 (milliseconds)
 // Quick checks to see if the current environment is trusted.
 - (BOOL)isSSIDTrusted:(nullable NSString *)ssid;
 - (BOOL)isBTTrusted:(nullable NSString *)btName;
+- (BOOL)isWiredAudioTrusted:(nullable NSString *)deviceName;
 
 // ===== Snapshots =====
 // Use this for synchronous reads in the same stack frame. Returns an autoreleased object tied to the cache lifetime. Do not store across asynchronous boundaries.

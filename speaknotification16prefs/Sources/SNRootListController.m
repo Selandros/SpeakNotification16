@@ -70,6 +70,25 @@ static BOOL SNReleaseResultURLIsAllowed(NSURL *url) {
     return [url.path hasPrefix:@"/Selandros/SpeakNotification16/releases/"];
 }
 
+static NSString *SNWiredDiagnosticText(NSString *value) {
+    if (![value isKindOfClass:NSString.class]) return @"-";
+    NSString *clean = [[value componentsSeparatedByCharactersInSet:NSCharacterSet.controlCharacterSet]
+                       componentsJoinedByString:@" "];
+    clean = [clean stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return clean.length > 0 ? clean : @"-";
+}
+
+static NSString *SNWiredEntryName(NSDictionary *entry) {
+    return [entry[@"name"] isKindOfClass:NSString.class] ? entry[@"name"] : @"-";
+}
+
+static BOOL SNWiredEntryMatchesOutput(NSDictionary *entry, NSString *portType, NSString *uid) {
+    return [entry[@"portType"] isKindOfClass:NSString.class] &&
+           [entry[@"uid"] isKindOfClass:NSString.class] &&
+           [entry[@"portType"] isEqualToString:portType] &&
+           [entry[@"uid"] isEqualToString:uid];
+}
+
 
 @interface SNRootStepperCell : PSTableCell
 @property (nonatomic, strong) UIStackView *controlsView;
@@ -657,6 +676,7 @@ static BOOL SNIsSpeakLogFile(NSString *filename) {
 @interface SNRootListController ()
 @property (nonatomic, strong) NSMutableArray<NSString *> *wifiItems; // ARC: strong instead of retain
 @property (nonatomic, strong) NSMutableArray<NSString *> *btItems;   // ARC: strong instead of retain
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *wiredAudioItems;
 @property (nonatomic, copy) NSString *manualReleaseCheckRequestID;
 @property (nonatomic, assign) BOOL manualReleaseCheckPending;
 @property (nonatomic, assign) NSUInteger manualReleaseCheckGeneration;
@@ -715,6 +735,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
     NSArray *ssids = [defs objectForKey:kSSIDsKey];
     NSArray *bts = [defs objectForKey:kBTKey];
+    NSArray *wiredAudio = [defs objectForKey:kWiredAudioDevicesV2Key];
 
     self.wifiItems = [ssids isKindOfClass:NSArray.class]
         ? [ssids mutableCopy]
@@ -723,6 +744,20 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     self.btItems = [bts isKindOfClass:NSArray.class]
         ? [bts mutableCopy]
         : [NSMutableArray array];
+
+    self.wiredAudioItems = [NSMutableArray array];
+    if ([wiredAudio isKindOfClass:NSArray.class]) {
+        for (id entry in wiredAudio) {
+            if (![entry isKindOfClass:NSDictionary.class]) continue;
+            NSString *name = entry[@"name"];
+            NSString *portType = entry[@"portType"];
+            NSString *uid = entry[@"uid"];
+            if (![name isKindOfClass:NSString.class] || name.length == 0 ||
+                ![portType isKindOfClass:NSString.class] || !SNIsTrustedWiredAudioPortType(portType) ||
+                !SNIsUsableWiredAudioUID(uid)) continue;
+            [self.wiredAudioItems addObject:@{ @"name": name, @"portType": portType, @"uid": uid }];
+        }
+    }
 
     id df = [defs objectForKey:@"globalFormat"];
     if (![df isKindOfClass:NSString.class]) {
@@ -1107,8 +1142,31 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
 }
 
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
-    [super setPreferenceValue:value specifier:specifier];
     NSString *key = [specifier propertyForKey:@"key"];
+    if ([key isEqualToString:kAllowAnyWiredAudioDeviceKey] && [value boolValue] &&
+        ![self sn_boolForKey:kAllowAnyWiredAudioDeviceKey defaultValue:NO]) {
+        __weak typeof(self) weakSelf = self;
+        UIAlertController *warning = [UIAlertController alertControllerWithTitle:@"Privacy Warning"
+                                                                           message:@"This setting allows notification speech through any detected wired or CarPlay audio route. This may include public speakers, conference systems, vehicles, docks, and adapters. Private notifications may be heard by others."
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+        [warning addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(__unused UIAlertAction *action) {
+            NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+            [defs setBool:NO forKey:kAllowAnyWiredAudioDeviceKey];
+            [defs synchronize];
+            [weakSelf reloadSpecifier:specifier animated:NO];
+        }]];
+        [warning addAction:[UIAlertAction actionWithTitle:@"Enable Anyway" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+            NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+            [defs setBool:YES forKey:kAllowAnyWiredAudioDeviceKey];
+            [defs synchronize];
+            [weakSelf reloadSpecifier:specifier animated:NO];
+            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), kSNPrefsNotify, NULL, NULL, true);
+        }]];
+        [self presentViewController:warning animated:YES completion:nil];
+        return;
+    }
+
+    [super setPreferenceValue:value specifier:specifier];
     BOOL debugChanged = [key isEqualToString:kSNDebugLoggingKey];
     if ([key isEqualToString:kSNReleaseTokenKey]) {
         [self reloadSpecifierID:kSNReleaseTokenStatusID animated:NO];
@@ -1538,6 +1596,9 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
 
     [self.btItems sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
     [self.wifiItems sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    [self.wiredAudioItems sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [SNWiredEntryName(a) localizedCaseInsensitiveCompare:SNWiredEntryName(b)];
+    }];
 
     if (self.btItems.count > 0) {
         NSInteger btAddBtn = [self indexOfSpecifierWithID:@"bt_add_btn"];
@@ -1564,6 +1625,22 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
                 NSString *ssid = [self.wifiItems objectAtIndex:i];
                 PSSpecifier *row = [PSSpecifier preferenceSpecifierNamed:ssid target:self set:NULL get:NULL detail:Nil cell:PSLinkCell edit:Nil];
                 [row setProperty:@"wifi" forKey:@"_inlineType"];
+                [row setProperty:@(i) forKey:@"_inlineIndex"];
+                row->action = @selector(inlineRowTapped:);
+                [_specifiers insertObject:row atIndex:(insertAt + (NSInteger)i)];
+            }
+        }
+    }
+
+    if (self.wiredAudioItems.count > 0) {
+        NSInteger wiredAddBtn = [self indexOfSpecifierWithID:@"wired_add_btn"];
+        NSInteger wiredAnchor = [self indexOfSpecifierWithID:@"wired_anchor"];
+        NSInteger insertAt = (wiredAddBtn != NSNotFound) ? wiredAddBtn + 1 : (wiredAnchor != NSNotFound ? wiredAnchor + 1 : NSNotFound);
+        if (insertAt != NSNotFound) {
+            for (NSUInteger i = 0; i < self.wiredAudioItems.count; i++) {
+                NSString *name = SNWiredEntryName([self.wiredAudioItems objectAtIndex:i]);
+                PSSpecifier *row = [PSSpecifier preferenceSpecifierNamed:name target:self set:NULL get:NULL detail:Nil cell:PSLinkCell edit:Nil];
+                [row setProperty:@"wired" forKey:@"_inlineType"];
                 [row setProperty:@(i) forKey:@"_inlineIndex"];
                 row->action = @selector(inlineRowTapped:);
                 [_specifiers insertObject:row atIndex:(insertAt + (NSInteger)i)];
@@ -1609,6 +1686,177 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
 
 - (void)wifiAddManual:(PSSpecifier *)spec { [self wifiAddCurrent:spec]; }
 - (void)btAddManual:(PSSpecifier *)spec { [self btAddCurrent:spec]; }
+
+- (void)sn_presentWiredAudioChooser:(NSArray<NSDictionary *> *)entries {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Select Wired Audio Device"
+                                                                     message:nil
+                                                              preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    for (NSDictionary *entry in entries) {
+        NSString *name = SNWiredEntryName(entry);
+        NSString *portType = entry[@"portType"];
+        NSString *uid = entry[@"uid"];
+        BOOL alreadyAdded = NO;
+        for (NSDictionary *saved in self.wiredAudioItems) {
+            if (SNWiredEntryMatchesOutput(saved, portType, uid)) { alreadyAdded = YES; break; }
+        }
+        NSString *title = alreadyAdded ? [NSString stringWithFormat:@"%@ (Already Added)", name] : name;
+        UIAlertAction *action = [UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *selectedAction) {
+            if (alreadyAdded) return;
+            if (!weakSelf) return;
+            for (NSDictionary *saved in weakSelf.wiredAudioItems) {
+                if (SNWiredEntryMatchesOutput(saved, portType, uid)) return;
+            }
+            [weakSelf.wiredAudioItems addObject:entry];
+            [weakSelf saveListsAndReload];
+        }];
+        action.enabled = !alreadyAdded;
+        [sheet addAction:action];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.sourceView = self.view;
+        sheet.popoverPresentationController.sourceRect = self.view.bounds;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)sn_addWiredAudioEntryImmediately:(NSDictionary *)entry {
+    NSString *name = SNWiredEntryName(entry);
+    NSString *portType = entry[@"portType"];
+    NSString *uid = entry[@"uid"];
+    if ([name isEqualToString:@"-"] || !SNIsUsableWiredAudioUID(uid)) return;
+    for (NSDictionary *saved in self.wiredAudioItems) {
+        if (SNWiredEntryMatchesOutput(saved, portType, uid)) return;
+    }
+    [self.wiredAudioItems addObject:@{ @"name": name, @"portType": portType, @"uid": uid }];
+    [self saveListsAndReload];
+}
+
+- (void)wiredAddCurrent:(PSSpecifier *)spec {
+    AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
+    NSArray<NSDictionary *> *trustedEntries = self.wiredAudioItems ?: @[];
+    NSMutableArray<NSDictionary *> *outputs = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *supportedEntries = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *identifiableEntries = [NSMutableArray array];
+    NSMutableString *details = [NSMutableString stringWithFormat:@"Outputs: %lu\n",
+                                (unsigned long)route.outputs.count];
+
+    NSUInteger outputIndex = 0;
+    for (AVAudioSessionPortDescription *output in route.outputs) {
+        NSString *rawName = [output.portName isKindOfClass:NSString.class] ? output.portName : @"";
+        NSString *rawType = [output.portType isKindOfClass:NSString.class] ? output.portType : @"";
+        NSString *rawUID = [output.UID isKindOfClass:NSString.class] ? output.UID : @"";
+        NSString *normalized = SNTrustedWiredAudioPortTypeLabel(rawType);
+        BOOL supported = SNIsTrustedWiredAudioPortType(rawType);
+        NSString *cleanName = SNWiredDiagnosticText(rawName);
+        BOOL identified = supported && ![cleanName isEqualToString:@"-"] && SNIsUsableWiredAudioUID(rawUID);
+        BOOL alreadyAdded = NO;
+        for (NSDictionary *saved in trustedEntries) {
+            if (SNWiredEntryMatchesOutput(saved, rawType, rawUID)) { alreadyAdded = YES; break; }
+        }
+        NSDictionary *entry = @{
+            @"name": cleanName,
+            @"rawName": rawName,
+            @"portType": rawType,
+            @"type": SNWiredDiagnosticText(rawType),
+            @"uid": SNWiredDiagnosticText(rawUID),
+            @"normalized": SNWiredDiagnosticText(normalized),
+            @"supported": @(supported),
+            @"identified": @(identified),
+            @"permanent": @(identified),
+            @"already": @(alreadyAdded)
+        };
+        [outputs addObject:entry];
+        if (supported) [supportedEntries addObject:entry];
+        if (identified) [identifiableEntries addObject:entry];
+        outputIndex++;
+        [details appendFormat:@"\n%lu. %@\nType: %@\nUID: %@\nNormalized: %@\nSupported: %@\nIdentified: %@\nPermanent supported: %@\nAdded: %@\n",
+                              (unsigned long)outputIndex,
+                              entry[@"name"], entry[@"type"], entry[@"uid"], entry[@"normalized"],
+                              supported ? @"Yes" : @"No", identified ? @"Yes" : @"No",
+                              identified ? @"Yes" : @"No", alreadyAdded ? @"Yes" : @"No"];
+    }
+    if (route.outputs.count == 0) {
+        [details appendString:@"\nNo output ports reported.\n"];
+    }
+
+    [details appendFormat:@"\nInputs: %lu\n", (unsigned long)route.inputs.count];
+    NSUInteger inputIndex = 0;
+    for (AVAudioSessionPortDescription *input in route.inputs) {
+        inputIndex++;
+        [details appendFormat:@"\n%lu. %@\nType: %@\nUID: %@\n",
+                              (unsigned long)inputIndex,
+                              SNWiredDiagnosticText(input.portName),
+                              SNWiredDiagnosticText(input.portType),
+                              SNWiredDiagnosticText(input.UID)];
+    }
+
+    NSArray<AVAudioSessionPortDescription *> *availableInputs = AVAudioSession.sharedInstance.availableInputs ?: @[];
+    [details appendFormat:@"\nAvailable inputs: %lu\n", (unsigned long)availableInputs.count];
+    NSUInteger availableInputIndex = 0;
+    for (AVAudioSessionPortDescription *input in availableInputs) {
+        availableInputIndex++;
+        [details appendFormat:@"\n%lu. %@\nType: %@\nUID: %@\n",
+                              (unsigned long)availableInputIndex,
+                              SNWiredDiagnosticText(input.portName),
+                              SNWiredDiagnosticText(input.portType),
+                              SNWiredDiagnosticText(input.UID)];
+    }
+
+    if ([self sn_debugLoggingEnabled]) {
+        NSMutableArray<NSString *> *routeLabels = [NSMutableArray array];
+        for (NSDictionary *entry in outputs) {
+            [routeLabels addObject:[NSString stringWithFormat:@"%@<%@ uid=%@ identified=%@ broadAllowed=%@>",
+                                    entry[@"name"], entry[@"type"], entry[@"uid"],
+                                    [entry[@"identified"] boolValue] ? @"yes" : @"no",
+                                    [entry[@"supported"] boolValue] ? @"yes" : @"no"]];
+        }
+        NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+        NSString *compact = [NSString stringWithFormat:@"outputs=%lu supported=%lu routes=%@",
+                             (unsigned long)outputs.count,
+                             (unsigned long)supportedEntries.count,
+                             routeLabels.count ? [routeLabels componentsJoinedByString:@","] : @"-"];
+        [defs setObject:compact forKey:kWiredAudioDiagnosticKey];
+        [defs synchronize];
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), kSNPrefsNotify, NULL, NULL, true);
+    }
+
+    if (identifiableEntries.count == 1) {
+        NSDictionary *entry = identifiableEntries.firstObject;
+        if ([entry[@"already"] boolValue]) {
+            NSString *name = SNWiredEntryName(entry);
+            UIAlertController *already = [UIAlertController alertControllerWithTitle:@"Already Added"
+                                                                                message:[NSString stringWithFormat:@"%@ is already in Trusted Connections.", name]
+                                                                         preferredStyle:UIAlertControllerStyleAlert];
+            [already addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:already animated:YES completion:nil];
+        } else {
+            [self sn_addWiredAudioEntryImmediately:entry];
+        }
+        return;
+    } else if (identifiableEntries.count > 1) {
+        [self sn_presentWiredAudioChooser:identifiableEntries];
+        return;
+    }
+
+    NSString *failureTitle = supportedEntries.count > 0 ? @"Cannot Identify Device" : @"Error";
+    NSString *failurePrefix = supportedEntries.count > 0
+        ? @"This audio device did not provide a unique identifier and cannot be added permanently. You can enable the broad fallback below, but it may expose private notifications through other connected audio devices.\n\n"
+        : @"No supported audio device was found.\n\n";
+    NSString *failureDetails = [failurePrefix stringByAppendingString:details];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:failureTitle
+                                                                     message:failureDetails
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *copyAction = [UIAlertAction actionWithTitle:@"Copy Details" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [UIPasteboard generalPasteboard].string = failureDetails;
+    }];
+    [alert addAction:copyAction];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)wiredAddManual:(PSSpecifier *)spec { [self wiredAddCurrent:spec]; }
 
 #pragma mark - Fetch helpers
 
@@ -1676,6 +1924,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
     [defs setObject:self.wifiItems forKey:kSSIDsKey];
     [defs setObject:self.btItems forKey:kBTKey];
+    [defs setObject:self.wiredAudioItems forKey:kWiredAudioDevicesV2Key];
     [defs synchronize];
 
     [self rebuildInlineLists];
@@ -1702,6 +1951,9 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     } else if ([type isEqualToString:@"bt"]) {
         if (idx >= self.btItems.count) return;
         item = [self.btItems objectAtIndex:idx];
+    } else if ([type isEqualToString:@"wired"]) {
+        if (idx >= self.wiredAudioItems.count) return;
+        item = SNWiredEntryName([self.wiredAudioItems objectAtIndex:idx]);
     } else {
         return;
     }
@@ -1716,6 +1968,9 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
             [weakSelf saveListsAndReload];
         } else if ([type isEqualToString:@"bt"]) {
             if (idx < weakSelf.btItems.count) [weakSelf.btItems removeObjectAtIndex:idx];
+            [weakSelf saveListsAndReload];
+        } else if ([type isEqualToString:@"wired"]) {
+            if (idx < weakSelf.wiredAudioItems.count) [weakSelf.wiredAudioItems removeObjectAtIndex:idx];
             [weakSelf saveListsAndReload];
         }
     }]];
@@ -1814,7 +2069,10 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
 
             // Inline lists
             kSSIDsKey: @[],
-            kBTKey: @[]
+            kBTKey: @[],
+            kWiredAudioDevicesKey: @[],
+            kWiredAudioDevicesV2Key: @[],
+            kAllowAnyWiredAudioDeviceKey: @NO
         };
 
         @try {
@@ -1830,6 +2088,7 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
 
         weakSelf.wifiItems = [NSMutableArray array];
         weakSelf.btItems   = [NSMutableArray array];
+        weakSelf.wiredAudioItems = [NSMutableArray array];
 
         [weakSelf rebuildInlineLists];
         [weakSelf reloadSpecifiers];

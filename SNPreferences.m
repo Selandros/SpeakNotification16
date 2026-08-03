@@ -70,6 +70,7 @@ NSString * const kKeyInterruptionTailMs   = @"interruptionTailMs";    // INT 0â€
 
     NSArray<NSString *> *_trustedSSIDs;
     NSArray<NSString *> *_trustedBTDevices;
+    NSArray<NSString *> *_trustedWiredAudioDevices;
     NSString *_messageFormat;
 
     BOOL _quietHoursEnabled;
@@ -106,6 +107,7 @@ NSString * const kKeyInterruptionTailMs   = @"interruptionTailMs";    // INT 0â€
         // Trusted/misc
         _trustedSSIDs = @[];
         _trustedBTDevices = @[];
+        _trustedWiredAudioDevices = @[];
         _messageFormat = @"{APP}: {TITLE}: {BODY}";
         _quietHoursEnabled = NO;
         _queueEnabled = NO;               // Match plist default.
@@ -143,6 +145,7 @@ NSString * const kKeyInterruptionTailMs   = @"interruptionTailMs";    // INT 0â€
 #if !__has_feature(objc_arc)
     if (_trustedSSIDs) { [_trustedSSIDs release]; _trustedSSIDs = nil; }     // release owned arrays
     if (_trustedBTDevices) { [_trustedBTDevices release]; _trustedBTDevices = nil; }
+    if (_trustedWiredAudioDevices) { [_trustedWiredAudioDevices release]; _trustedWiredAudioDevices = nil; }
     if (_messageFormat) { [_messageFormat release]; _messageFormat = nil; }
     [super dealloc];
 #endif
@@ -226,6 +229,7 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
 
     id ssids = [defs objectForKey:kSSIDsKey];
     id bts   = [defs objectForKey:kBTKey];
+    id wired = [defs objectForKey:kWiredAudioDevicesKey];
 
     NSString *fmt = [defs stringForKey:kKeyGlobalFormat];
     if (![fmt isKindOfClass:NSString.class] || fmt.length == 0) {
@@ -241,21 +245,25 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
 
     NSArray<NSString *> *ssidArr = ([ssids isKindOfClass:NSArray.class] ? ssids : @[]);
     NSArray<NSString *> *btArr   = ([bts   isKindOfClass:NSArray.class] ? bts   : @[]);
+    NSArray<NSString *> *wiredArr = ([wired isKindOfClass:NSArray.class] ? wired : @[]);
 
 // release old ivars before assigning new copies (MRC only)
 #if !__has_feature(objc_arc)
     if (self->_trustedSSIDs) { [self->_trustedSSIDs release]; self->_trustedSSIDs = nil; }
     if (self->_trustedBTDevices) { [self->_trustedBTDevices release]; self->_trustedBTDevices = nil; }
+    if (self->_trustedWiredAudioDevices) { [self->_trustedWiredAudioDevices release]; self->_trustedWiredAudioDevices = nil; }
     if (self->_messageFormat) { [self->_messageFormat release]; self->_messageFormat = nil; }
 #endif
 
 #if !__has_feature(objc_arc)
     self->_trustedSSIDs = [ssidArr copy];
     self->_trustedBTDevices = [btArr copy];
+    self->_trustedWiredAudioDevices = [wiredArr copy];
     self->_messageFormat = [fmt copy];
 #else
     _trustedSSIDs = [ssidArr copy];
     _trustedBTDevices = [btArr copy];
+    _trustedWiredAudioDevices = [wiredArr copy];
     _messageFormat = [fmt copy];
 #endif
     self->_quietHoursEnabled = [qHours isKindOfClass:NSNumber.class] ? qHours.boolValue : NO;
@@ -362,6 +370,12 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
     return [_trustedBTDevices containsObject:btName];
 }
 
+- (BOOL)isWiredAudioTrusted:(NSString *)deviceName {
+    if (_trustedWiredAudioDevices.count == 0) return YES;
+    if (deviceName.length == 0) return NO;
+    return [_trustedWiredAudioDevices containsObject:deviceName];
+}
+
 #pragma mark - Synthesize readonlys
 
 // Core behavior
@@ -387,6 +401,7 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
 // Trusted/misc
 - (NSArray<NSString *> *)trustedSSIDs { return _trustedSSIDs; }
 - (NSArray<NSString *> *)trustedBTDevices { return _trustedBTDevices; }
+- (NSArray<NSString *> *)trustedWiredAudioDevices { return _trustedWiredAudioDevices; }
 - (NSString *)messageFormat { return _messageFormat; }
 - (BOOL)quietHoursEnabled { return _quietHoursEnabled; }
 - (BOOL)queueEnabled { return _queueEnabled; }
@@ -465,6 +480,7 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
         // Trusted / misc
         kSSIDsKey: _trustedSSIDs ?: @[],
         kBTKey: _trustedBTDevices ?: @[],
+        kWiredAudioDevicesKey: _trustedWiredAudioDevices ?: @[],
         @"messageFormat": _messageFormat ?: @"{APP}: {TITLE}: {BODY}",
         @"quietHoursEnabled": @(_quietHoursEnabled),
         @"queueEnabled": @(_queueEnabled),
