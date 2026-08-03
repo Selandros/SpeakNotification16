@@ -2,6 +2,7 @@
 // Definitions compiled into each target (tweak + prefs).
 
 #import "SNSharedKeys.h"
+#import <AVFoundation/AVFoundation.h>
 
 NSString * const kSNPrefsSuite = @"com.selandros.speaknotification16";
 CFStringRef const kSNPrefsNotify = CFSTR("com.selandros.speaknotification16/prefsChanged");
@@ -18,6 +19,39 @@ NSString * const kSNSelectedVoiceIdentifierByLanguageKey = @"selectedVoiceIdenti
 NSString * const kSNLastUsedVoiceByLanguageKey = @"lastUsedVoiceByLanguage";
 NSString * const kBTKey = @"trustedBTDevices";
 NSString * const kSSIDsKey = @"trustedSSIDs";
+NSString * const kWiredAudioDevicesKey = @"trustedWiredAudioDevices";
+NSString * const kWiredAudioDevicesV2Key = @"trustedWiredAudioDevicesV2";
+NSString * const kAllowAnyWiredAudioDeviceKey = @"allowAnyWiredAudioDevice";
+NSString * const kWiredAudioDiagnosticKey = @"wiredAudioDiagnosticPending";
+
+NSString *SNTrustedWiredAudioPortTypeLabel(NSString *portType)
+{
+    if (![portType isKindOfClass:NSString.class] || portType.length == 0) return nil;
+    if ([portType isEqualToString:AVAudioSessionPortHeadphones]) return @"Headphones";
+    if ([portType isEqualToString:AVAudioSessionPortUSBAudio]) return @"USBAudio";
+    if ([portType isEqualToString:AVAudioSessionPortLineOut]) return @"LineOut";
+    if ([portType isEqualToString:AVAudioSessionPortHDMI]) return @"HDMI";
+    if ([portType isEqualToString:AVAudioSessionPortDisplayPort]) return @"DisplayPort";
+    if ([portType isEqualToString:AVAudioSessionPortCarAudio]) return @"CarAudio";
+    return nil;
+}
+
+BOOL SNIsTrustedWiredAudioPortType(NSString *portType)
+{
+    return SNTrustedWiredAudioPortTypeLabel(portType).length > 0;
+}
+
+BOOL SNIsUsableWiredAudioUID(NSString *uid)
+{
+    if (![uid isKindOfClass:NSString.class]) return NO;
+    NSString *value = [uid stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (value.length == 0) return NO;
+    NSArray<NSString *> *placeholders = @[@"-", @"unknown", @"none", @"null", @"n/a", @"default", @"speaker", @"receiver", @"carplay"];
+    for (NSString *placeholder in placeholders) {
+        if ([value caseInsensitiveCompare:placeholder] == NSOrderedSame) return NO;
+    }
+    return YES;
+}
 
 NSString *SNNormalizeVoiceLanguage(NSString *language)
 {

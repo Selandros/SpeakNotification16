@@ -1022,20 +1022,83 @@ static inline BOOL SN_ListContainsString(NSArray *list, NSString *needle) {
     return NO;
 }
 
+static inline BOOL SN_CurrentRouteHasTrustedWiredAudio(NSArray *trustedDevices) {
+    @try {
+        AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
+        for (AVAudioSessionPortDescription *output in route.outputs) {
+            if (!SNIsTrustedWiredAudioPortType(output.portType) || output.portName.length == 0 ||
+                !SNIsUsableWiredAudioUID(output.UID)) continue;
+            BOOL matched = NO;
+            for (NSDictionary *entry in trustedDevices) {
+                if (![entry isKindOfClass:NSDictionary.class]) continue;
+                if ([entry[@"portType"] isKindOfClass:NSString.class] &&
+                    [entry[@"uid"] isKindOfClass:NSString.class] &&
+                    [entry[@"portType"] isEqualToString:output.portType] &&
+                    [entry[@"uid"] isEqualToString:output.UID]) {
+                    matched = YES;
+                    break;
+                }
+            }
+            if (DBG_POLICY_ON) {
+                SNLOGFMT(@"[POLICY] trusted wired | type=%@ name=%@ uid=%@ matched=%d",
+                         output.portType, output.portName, output.UID, (int)matched);
+            }
+            if (matched) return YES;
+        }
+    } @catch (...) {}
+    return NO;
+}
+
+static inline BOOL SN_CurrentRouteAllowsAnyWiredAudio(void) {
+    @try {
+        AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
+        for (AVAudioSessionPortDescription *output in route.outputs) {
+            if (SNIsTrustedWiredAudioPortType(output.portType)) return YES;
+        }
+    } @catch (...) {}
+    return NO;
+}
+
+static inline NSString *SN_CurrentWiredAudioLogValue(void) {
+    @try {
+        AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
+        NSMutableArray<NSString *> *entries = [NSMutableArray array];
+        for (AVAudioSessionPortDescription *output in route.outputs) {
+            if (!SNIsTrustedWiredAudioPortType(output.portType) || output.portName.length == 0) continue;
+            NSString *name = [[output.portName componentsSeparatedByCharactersInSet:NSCharacterSet.controlCharacterSet]
+                              componentsJoinedByString:@" "];
+            name = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            NSString *type = SNTrustedWiredAudioPortTypeLabel(output.portType);
+            if (name.length > 0 && type.length > 0) {
+                [entries addObject:[NSString stringWithFormat:@"%@<%@>", name, type]];
+            }
+        }
+        return entries.count > 0 ? [entries componentsJoinedByString:@","] : @"-";
+    } @catch (...) {
+        return @"-";
+    }
+}
+
 static inline BOOL SN_IsTrustedEnvAllowed(void) {
     if (!SN_PrefBoolFast(kSNTrustedToggleKey, NO)) return YES;
 
     NSUserDefaults *defs = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
     id ssidsObj = [defs objectForKey:kSSIDsKey];
     id btObj    = [defs objectForKey:kBTKey];
+    id wiredObj = [defs objectForKey:kWiredAudioDevicesV2Key];
+    BOOL allowAnyWired = [defs boolForKey:kAllowAnyWiredAudioDeviceKey];
     NSArray *ssids = [ssidsObj isKindOfClass:NSArray.class] ? (NSArray *)ssidsObj : nil;
     NSArray *bts   = [btObj isKindOfClass:NSArray.class]    ? (NSArray *)btObj    : nil;
+    NSArray *wired = [wiredObj isKindOfClass:NSArray.class] ? (NSArray *)wiredObj : nil;
 
     NSString *curSSID = SN_CurrentSSID();
     if (curSSID && SN_ListContainsString(ssids, curSSID)) return YES;
 
     NSString *curBT = SN_CurrentBTName();
     if (curBT && SN_ListContainsString(bts, curBT)) return YES;
+
+    if (SN_CurrentRouteHasTrustedWiredAudio(wired)) return YES;
+    if (allowAnyWired && SN_CurrentRouteAllowsAnyWiredAudio()) return YES;
 
     return NO;
 }
@@ -4410,7 +4473,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.1";
+static NSString * const kReleaseInstalledVersion = @"2.1.2";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
@@ -6245,6 +6308,14 @@ static void SNReleaseAlertsPreferencesChanged(void)
     dispatch_async(gReleaseQueue, ^{
         NSUserDefaults *defs = sn_release_defaults();
         [defs synchronize];
+        NSString *wiredDiagnostic = [defs stringForKey:kWiredAudioDiagnosticKey];
+        if (wiredDiagnostic.length) {
+            if (gReleaseDebug.load(std::memory_order_acquire)) {
+                RELEASE_LOG(@"[WIRED-TEST] %@", wiredDiagnostic);
+            }
+            [defs removeObjectForKey:kWiredAudioDiagnosticKey];
+            [defs synchronize];
+        }
         BOOL enabled = sn_release_enabled(defs);
         NSString *token = sn_release_token(defs);
         BOOL relevantChange = !gReleasePrefsSnapshotValid ||
@@ -6434,7 +6505,7 @@ static uint64_t SN_Seq = 0;
 
                 if (!blocked && onlyTrusted) {
                     if (!sn_isTrustedConnectionOK()) {
-                        /*if (DBG_POLICY_ON) SNLOGFMT(@"[POLICY] blocked: untrusted connection (SSID/BT) | onlyTrusted=1");*/
+                        /*if (DBG_POLICY_ON) SNLOGFMT(@"[POLICY] blocked: untrusted connection (SSID/BT/Wired) | onlyTrusted=1");*/
                         blocked = YES;
                     }
                 }
@@ -6556,7 +6627,7 @@ static uint64_t SN_Seq = 0;
                 NSString *logTitle = DBG_PRIVATE_TEXT_ON ? (title ?: @"") : @"<hidden>";
                 NSString *logSubtitle = DBG_PRIVATE_TEXT_ON ? (subtitle ?: @"-") : @"<hidden>";
                 NSString *logBody = DBG_PRIVATE_TEXT_ON ? (body ?: @"-") : @"<hidden>";
-                SNLOGFMT(@"[NOTIF] %02llu | title_len=%lu subtitle_len=%lu body_len=%lu | bulletin=%@ publisher=%@ | sectionName=%@ sectionID=%@ | title=\"%@\" subtitle=\"%@\" body=\"%@\" | otherAudio=%@ vol=%d%% muted=%@ locked=%@ | fgApp=%@ (%@) | nowPlayingApp=%@ (%@) playing=%@ route=%@ | screen=%d%% %@ | battery=%d%%(%@) lowPower=%@ | wifi=%@ bt=%@",
+                SNLOGFMT(@"[NOTIF] %02llu | title_len=%lu subtitle_len=%lu body_len=%lu | bulletin=%@ publisher=%@ | sectionName=%@ sectionID=%@ | title=\"%@\" subtitle=\"%@\" body=\"%@\" | otherAudio=%@ vol=%d%% muted=%@ locked=%@ | fgApp=%@ (%@) | nowPlayingApp=%@ (%@) playing=%@ route=%@ | screen=%d%% %@ | battery=%d%%(%@) lowPower=%@ | wifi=%@ bt=%@ wired=%@",
                          (unsigned long long)seq,
                          (unsigned long)title.length, (unsigned long)subtitle.length, (unsigned long)body.length,
                          (bulletinID ?: @""), (publisherID ?: @""),
@@ -6575,7 +6646,8 @@ static uint64_t SN_Seq = 0;
                          battPct, (battState ?: @""),
                          (lpm ? @"YES" : @"NO"),
                          (SN_WiFiCurrentSSID() ?: @"-"),
-                         (SN_CurrentBTName() ?: @"-"));
+                         (SN_CurrentBTName() ?: @"-"),
+                         SN_CurrentWiredAudioLogValue());
             }
 
             // Build message and choose language

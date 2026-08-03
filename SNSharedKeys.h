@@ -18,5 +18,20 @@ extern NSString * const kSNSelectedVoiceIdentifierByLanguageKey;
 extern NSString * const kSNLastUsedVoiceByLanguageKey;
 extern NSString * const kBTKey;
 extern NSString * const kSSIDsKey;
+extern NSString * const kWiredAudioDevicesKey;
+extern NSString * const kWiredAudioDevicesV2Key;
+extern NSString * const kAllowAnyWiredAudioDeviceKey;
+extern NSString * const kWiredAudioDiagnosticKey;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 NSString *SNNormalizeVoiceLanguage(NSString *language);
+BOOL SNIsTrustedWiredAudioPortType(NSString *portType);
+NSString *SNTrustedWiredAudioPortTypeLabel(NSString *portType);
+BOOL SNIsUsableWiredAudioUID(NSString *uid);
+
+#ifdef __cplusplus
+}
+#endif
