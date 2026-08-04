@@ -22,6 +22,7 @@ extern NSString * const kWiredAudioDevicesKey;
 extern NSString * const kWiredAudioDevicesV2Key;
 extern NSString * const kAllowAnyWiredAudioDeviceKey;
 extern NSString * const kWiredAudioDiagnosticKey;
+extern NSString * const kTrustedConnectionAliasesV1Key;
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,7 @@ NSString *SNNormalizeVoiceLanguage(NSString *language);
 BOOL SNIsTrustedWiredAudioPortType(NSString *portType);
 NSString *SNTrustedWiredAudioPortTypeLabel(NSString *portType);
 BOOL SNIsUsableWiredAudioUID(NSString *uid);
+NSString *SNCanonicalWiredAudioUID(NSString *portType, NSString *rawUID);
 
 #ifdef __cplusplus
 }

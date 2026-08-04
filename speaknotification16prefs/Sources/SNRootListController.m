@@ -82,11 +82,58 @@ static NSString *SNWiredEntryName(NSDictionary *entry) {
     return [entry[@"name"] isKindOfClass:NSString.class] ? entry[@"name"] : @"-";
 }
 
+static NSString *SNWiredEntryCanonicalUID(NSDictionary *entry) {
+    return SNCanonicalWiredAudioUID(entry[@"portType"], entry[@"uid"]);
+}
+
+static NSString *SNWiredAliasKey(NSDictionary *entry) {
+    NSString *portType = [entry[@"portType"] isKindOfClass:NSString.class] ? entry[@"portType"] : @"";
+    NSString *canonicalUID = SNWiredEntryCanonicalUID(entry);
+    return (portType.length && canonicalUID.length)
+        ? [NSString stringWithFormat:@"wired:%@|%@", portType, canonicalUID]
+        : @"";
+}
+
+static NSString *SNWiredEntryDefaultName(NSDictionary *entry) {
+    NSString *name = SNWiredEntryName(entry);
+    NSString *portType = entry[@"portType"];
+    NSString *canonicalUID = SNWiredEntryCanonicalUID(entry);
+    if (name.length == 0 || [name isEqualToString:@"-"] || canonicalUID.length == 0) return name;
+
+    NSString *stableSuffix = nil;
+    if ([portType isEqualToString:AVAudioSessionPortCarAudio]) {
+        NSString *mac = [[canonicalUID componentsSeparatedByString:@"-Audio-AudioMain"] firstObject];
+        NSArray *parts = [mac componentsSeparatedByString:@":"];
+        if (parts.count >= 2) stableSuffix = [NSString stringWithFormat:@"%@:%@", parts[parts.count - 2], parts.lastObject];
+    }
+    if (stableSuffix.length == 0) {
+        NSCharacterSet *allowed = [NSCharacterSet alphanumericCharacterSet];
+        NSMutableString *compact = [NSMutableString string];
+        for (NSUInteger i = 0; i < canonicalUID.length; i++) {
+            unichar c = [canonicalUID characterAtIndex:i];
+            if ([allowed characterIsMember:c]) [compact appendFormat:@"%C", c];
+        }
+        stableSuffix = compact.length > 4 ? [compact substringFromIndex:compact.length - 4] : compact;
+    }
+    return stableSuffix.length ? [NSString stringWithFormat:@"%@ · %@", name, stableSuffix] : name;
+}
+
+static NSString *SNConnectionAliasKey(NSString *type, NSString *identity) {
+    return (type.length && identity.length) ? [NSString stringWithFormat:@"%@:%@", type, identity] : @"";
+}
+
+static NSString *SNConnectionDisplayName(NSString *type, NSString *identity, NSString *defaultName, NSDictionary *aliases) {
+    NSString *key = [type isEqualToString:@"wired"] ? identity : SNConnectionAliasKey(type, identity);
+    NSString *alias = [aliases[key] isKindOfClass:NSString.class] ? aliases[key] : @"";
+    return alias.length ? alias : defaultName;
+}
+
 static BOOL SNWiredEntryMatchesOutput(NSDictionary *entry, NSString *portType, NSString *uid) {
     return [entry[@"portType"] isKindOfClass:NSString.class] &&
            [entry[@"uid"] isKindOfClass:NSString.class] &&
-           [entry[@"portType"] isEqualToString:portType] &&
-           [entry[@"uid"] isEqualToString:uid];
+           [SNTrustedWiredAudioPortTypeLabel(entry[@"portType"]) isEqualToString:SNTrustedWiredAudioPortTypeLabel(portType)] &&
+           [SNCanonicalWiredAudioUID(entry[@"portType"], entry[@"uid"])
+            isEqualToString:SNCanonicalWiredAudioUID(portType, uid)];
 }
 
 
@@ -677,6 +724,7 @@ static BOOL SNIsSpeakLogFile(NSString *filename) {
 @property (nonatomic, strong) NSMutableArray<NSString *> *wifiItems; // ARC: strong instead of retain
 @property (nonatomic, strong) NSMutableArray<NSString *> *btItems;   // ARC: strong instead of retain
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *wiredAudioItems;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *connectionAliases;
 @property (nonatomic, copy) NSString *manualReleaseCheckRequestID;
 @property (nonatomic, assign) BOOL manualReleaseCheckPending;
 @property (nonatomic, assign) NSUInteger manualReleaseCheckGeneration;
@@ -736,6 +784,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     NSArray *ssids = [defs objectForKey:kSSIDsKey];
     NSArray *bts = [defs objectForKey:kBTKey];
     NSArray *wiredAudio = [defs objectForKey:kWiredAudioDevicesV2Key];
+    NSDictionary *aliases = [defs objectForKey:kTrustedConnectionAliasesV1Key];
 
     self.wifiItems = [ssids isKindOfClass:NSArray.class]
         ? [ssids mutableCopy]
@@ -745,7 +794,17 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
         ? [bts mutableCopy]
         : [NSMutableArray array];
 
+    self.connectionAliases = [NSMutableDictionary dictionary];
+    if ([aliases isKindOfClass:NSDictionary.class]) {
+        [aliases enumerateKeysAndObjectsUsingBlock:^(id key, id value, __unused BOOL *stop) {
+            if ([key isKindOfClass:NSString.class] && [value isKindOfClass:NSString.class] && [value length] > 0) {
+                self.connectionAliases[key] = value;
+            }
+        }];
+    }
+
     self.wiredAudioItems = [NSMutableArray array];
+    NSMutableSet *wiredIdentityKeys = [NSMutableSet set];
     if ([wiredAudio isKindOfClass:NSArray.class]) {
         for (id entry in wiredAudio) {
             if (![entry isKindOfClass:NSDictionary.class]) continue;
@@ -755,6 +814,10 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
             if (![name isKindOfClass:NSString.class] || name.length == 0 ||
                 ![portType isKindOfClass:NSString.class] || !SNIsTrustedWiredAudioPortType(portType) ||
                 !SNIsUsableWiredAudioUID(uid)) continue;
+            NSString *canonicalUID = SNCanonicalWiredAudioUID(portType, uid);
+            NSString *identityKey = [NSString stringWithFormat:@"%@|%@", SNTrustedWiredAudioPortTypeLabel(portType), canonicalUID];
+            if ([wiredIdentityKeys containsObject:identityKey]) continue;
+            [wiredIdentityKeys addObject:identityKey];
             [self.wiredAudioItems addObject:@{ @"name": name, @"portType": portType, @"uid": uid }];
         }
     }
@@ -1607,6 +1670,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
         if (insertAt != NSNotFound) {
             for (NSUInteger i = 0; i < self.btItems.count; i++) {
                 NSString *name = [self.btItems objectAtIndex:i];
+                name = SNConnectionDisplayName(@"bluetooth", name, name, self.connectionAliases);
                 PSSpecifier *row = [PSSpecifier preferenceSpecifierNamed:name target:self set:NULL get:NULL detail:Nil cell:PSLinkCell edit:Nil];
                 [row setProperty:@"bt" forKey:@"_inlineType"];
                 [row setProperty:@(i) forKey:@"_inlineIndex"];
@@ -1623,6 +1687,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
         if (insertAt != NSNotFound) {
             for (NSUInteger i = 0; i < self.wifiItems.count; i++) {
                 NSString *ssid = [self.wifiItems objectAtIndex:i];
+                ssid = SNConnectionDisplayName(@"wifi", ssid, ssid, self.connectionAliases);
                 PSSpecifier *row = [PSSpecifier preferenceSpecifierNamed:ssid target:self set:NULL get:NULL detail:Nil cell:PSLinkCell edit:Nil];
                 [row setProperty:@"wifi" forKey:@"_inlineType"];
                 [row setProperty:@(i) forKey:@"_inlineIndex"];
@@ -1638,7 +1703,8 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
         NSInteger insertAt = (wiredAddBtn != NSNotFound) ? wiredAddBtn + 1 : (wiredAnchor != NSNotFound ? wiredAnchor + 1 : NSNotFound);
         if (insertAt != NSNotFound) {
             for (NSUInteger i = 0; i < self.wiredAudioItems.count; i++) {
-                NSString *name = SNWiredEntryName([self.wiredAudioItems objectAtIndex:i]);
+                NSDictionary *entry = [self.wiredAudioItems objectAtIndex:i];
+                NSString *name = SNConnectionDisplayName(@"wired", SNWiredAliasKey(entry), SNWiredEntryDefaultName(entry), self.connectionAliases);
                 PSSpecifier *row = [PSSpecifier preferenceSpecifierNamed:name target:self set:NULL get:NULL detail:Nil cell:PSLinkCell edit:Nil];
                 [row setProperty:@"wired" forKey:@"_inlineType"];
                 [row setProperty:@(i) forKey:@"_inlineIndex"];
@@ -1925,6 +1991,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     [defs setObject:self.wifiItems forKey:kSSIDsKey];
     [defs setObject:self.btItems forKey:kBTKey];
     [defs setObject:self.wiredAudioItems forKey:kWiredAudioDevicesV2Key];
+    [defs setObject:self.connectionAliases ?: @{} forKey:kTrustedConnectionAliasesV1Key];
     [defs synchronize];
 
     [self rebuildInlineLists];
@@ -1943,36 +2010,61 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     if (![type isKindOfClass:NSString.class] || ![nidx isKindOfClass:NSNumber.class]) return;
 
     NSUInteger idx = [nidx unsignedIntegerValue];
-    NSString *item = nil;
+    NSString *identity = nil;
+    NSString *defaultName = nil;
+    NSString *typeLabel = nil;
+    NSDictionary *wiredEntry = nil;
 
     if ([type isEqualToString:@"wifi"]) {
         if (idx >= self.wifiItems.count) return;
-        item = [self.wifiItems objectAtIndex:idx];
+        identity = [self.wifiItems objectAtIndex:idx];
+        defaultName = identity;
+        typeLabel = @"wifi";
     } else if ([type isEqualToString:@"bt"]) {
         if (idx >= self.btItems.count) return;
-        item = [self.btItems objectAtIndex:idx];
+        identity = [self.btItems objectAtIndex:idx];
+        defaultName = identity;
+        typeLabel = @"bluetooth";
     } else if ([type isEqualToString:@"wired"]) {
         if (idx >= self.wiredAudioItems.count) return;
-        item = SNWiredEntryName([self.wiredAudioItems objectAtIndex:idx]);
+        wiredEntry = [self.wiredAudioItems objectAtIndex:idx];
+        identity = SNWiredAliasKey(wiredEntry);
+        defaultName = SNWiredEntryDefaultName(wiredEntry);
+        typeLabel = @"wired";
     } else {
         return;
     }
 
-    NSString *title = [type isEqualToString:@"wifi"] ? @"Remove SSID?" : @"Remove device?";
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:item preferredStyle:UIAlertControllerStyleAlert];
+    NSString *aliasKey = [typeLabel isEqualToString:@"wired"] ? identity : SNConnectionAliasKey(typeLabel, identity);
+    NSString *displayName = SNConnectionDisplayName(typeLabel, identity, defaultName, self.connectionAliases);
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Rename Trusted Connection"
+                                                                   message:displayName
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = defaultName;
+        field.text = displayName;
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
 
     __weak typeof(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        if (!weakSelf) return;
+        NSString *text = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (text.length > 0 && ![text isEqualToString:defaultName]) weakSelf.connectionAliases[aliasKey] = text;
+        else [weakSelf.connectionAliases removeObjectForKey:aliasKey];
+        [weakSelf saveListsAndReload];
+    }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+        if (!weakSelf) return;
         if ([type isEqualToString:@"wifi"]) {
             if (idx < weakSelf.wifiItems.count) [weakSelf.wifiItems removeObjectAtIndex:idx];
-            [weakSelf saveListsAndReload];
         } else if ([type isEqualToString:@"bt"]) {
             if (idx < weakSelf.btItems.count) [weakSelf.btItems removeObjectAtIndex:idx];
-            [weakSelf saveListsAndReload];
         } else if ([type isEqualToString:@"wired"]) {
             if (idx < weakSelf.wiredAudioItems.count) [weakSelf.wiredAudioItems removeObjectAtIndex:idx];
-            [weakSelf saveListsAndReload];
         }
+        [weakSelf.connectionAliases removeObjectForKey:aliasKey];
+        [weakSelf saveListsAndReload];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:ac animated:YES completion:nil];
@@ -2072,7 +2164,8 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
             kBTKey: @[],
             kWiredAudioDevicesKey: @[],
             kWiredAudioDevicesV2Key: @[],
-            kAllowAnyWiredAudioDeviceKey: @NO
+            kAllowAnyWiredAudioDeviceKey: @NO,
+            kTrustedConnectionAliasesV1Key: @{}
         };
 
         @try {
@@ -2089,6 +2182,7 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
         weakSelf.wifiItems = [NSMutableArray array];
         weakSelf.btItems   = [NSMutableArray array];
         weakSelf.wiredAudioItems = [NSMutableArray array];
+        weakSelf.connectionAliases = [NSMutableDictionary dictionary];
 
         [weakSelf rebuildInlineLists];
         [weakSelf reloadSpecifiers];

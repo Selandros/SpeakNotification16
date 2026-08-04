@@ -888,14 +888,6 @@ static inline NSString *sn_language_prefix(NSString *language)
     return (prefix.length >= 2) ? prefix : nil;
 }
 
-static inline BOOL sn_language_is_nordic(NSString *prefix)
-{
-    return ([prefix isEqualToString:@"sv"] ||
-            [prefix isEqualToString:@"nb"] ||
-            [prefix isEqualToString:@"nn"] ||
-            [prefix isEqualToString:@"da"]);
-}
-
 static inline double sn_language_hypothesis_score(NSDictionary *hypotheses, NSString *language)
 {
     return language.length ? [[hypotheses objectForKey:language] doubleValue] : 0.0;
@@ -916,21 +908,48 @@ static NSString *sn_explicit_voice_language(void)
     return sn_normalized_voice_language([defaults objectForKey:@"voiceLang"]);
 }
 
+static void sn_language_text_metrics(NSString *sample, NSUInteger *letterCount, NSUInteger *wordCount)
+{
+    NSUInteger letters = 0;
+    NSUInteger words = 0;
+    if ([sample isKindOfClass:NSString.class] && sample.length > 0) {
+        for (NSUInteger i = 0; i < sample.length; i++) {
+            if ([[NSCharacterSet letterCharacterSet] characterIsMember:[sample characterAtIndex:i]]) letters++;
+        }
+        NSArray *parts = [sample componentsSeparatedByCharactersInSet:[[NSCharacterSet letterCharacterSet] invertedSet]];
+        for (NSString *part in parts) if (part.length > 0) words++;
+    }
+    if (letterCount) *letterCount = letters;
+    if (wordCount) *wordCount = words;
+}
+
 static NSString *sn_detect_language_nl(NSString *sample,
                                         NSString **detectedLanguage,
-                                        NSString **reason)
+                                        NSString **reason,
+                                        NSString **diagnostic)
 {
     NSString *systemLanguage = [SNStringUtils systemPrimaryBCP47] ?: @"en-US";
+    NSUInteger letterCount = 0;
+    NSUInteger wordCount = 0;
+    sn_language_text_metrics(sample, &letterCount, &wordCount);
     if (detectedLanguage) *detectedLanguage = nil;
     if (reason) *reason = @"empty-source";
+    if (diagnostic) *diagnostic = nil;
 
     NSString *explicitLanguage = sn_explicit_voice_language();
     if (explicitLanguage.length > 0) {
         if (detectedLanguage) *detectedLanguage = [explicitLanguage copy];
         if (reason) *reason = @"explicit-user";
+        if (diagnostic) *diagnostic = [[NSString stringWithFormat:@"chars=%lu words=%lu candidates=- system=%@ chosen=%@ reason=explicitVoiceLanguage",
+                                       (unsigned long)letterCount, (unsigned long)wordCount,
+                                       systemLanguage, explicitLanguage] copy];
         return explicitLanguage;
     }
-    if (![sample isKindOfClass:NSString.class] || sample.length == 0) return systemLanguage;
+    if (![sample isKindOfClass:NSString.class] || sample.length == 0) {
+        if (diagnostic) *diagnostic = [[NSString stringWithFormat:@"chars=0 words=0 candidates=- system=%@ chosen=%@ reason=noCandidate",
+                                       systemLanguage, systemLanguage] copy];
+        return systemLanguage;
+    }
 
     NLLanguageRecognizer *recognizer = [[NLLanguageRecognizer alloc] init];
     NSString *dominant = nil;
@@ -942,6 +961,9 @@ static NSString *sn_detect_language_nl(NSString *sample,
     } @catch (...) {
         [recognizer release];
         if (reason) *reason = @"recognizer-failure";
+        if (diagnostic) *diagnostic = [[NSString stringWithFormat:@"chars=%lu words=%lu candidates=- system=%@ chosen=%@ reason=recognizerFailure",
+                                       (unsigned long)letterCount, (unsigned long)wordCount,
+                                       systemLanguage, systemLanguage] copy];
         return systemLanguage;
     }
 
@@ -958,19 +980,32 @@ static NSString *sn_detect_language_nl(NSString *sample,
     NSString *detected = dominant.length ? [SNStringUtils clampAllowedBCP47:dominant] :
                          (topPrefix.length ? [SNStringUtils mapPrefixToBCP47:topPrefix] : nil);
     double topScore = sn_language_hypothesis_score(hypotheses, top);
+    NSString *second = languages.count > 1 ? [languages objectAtIndex:1] : nil;
+    NSString *third = languages.count > 2 ? [languages objectAtIndex:2] : nil;
+    double secondScore = sn_language_hypothesis_score(hypotheses, second);
+    double thirdScore = sn_language_hypothesis_score(hypotheses, third);
     NSString *finalLanguage = systemLanguage;
+    BOOL shortText = (letterCount < 20 || wordCount < 3);
+    double minimumScore = shortText ? 0.90 : 0.75;
+    double minimumMargin = shortText ? 0.20 : 0.15;
 
     if (topPrefix.length == 0) {
         if (reason) *reason = @"no-result";
-    } else if (topScore >= 0.75) {
+    } else if (topScore >= minimumScore && (topScore - secondScore) >= minimumMargin) {
         finalLanguage = [SNStringUtils clampAllowedBCP47:topPrefix];
-        if (reason) *reason = @"nl-winner";
-    } else if (sn_language_is_nordic(topPrefix)) {
-        finalLanguage = [SNStringUtils clampAllowedBCP47:topPrefix];
-        if (reason) *reason = @"low-confidence-nordic";
+        if (reason) *reason = shortText ? @"short-confident" : @"confident";
     } else if (reason) {
-        *reason = @"low-confidence-system";
+        *reason = shortText ? @"short-fallback" : @"uncertain-fallback";
     }
+
+    NSMutableArray *candidateParts = [NSMutableArray array];
+    if (top.length) [candidateParts addObject:[NSString stringWithFormat:@"%@:%0.2f", sn_language_prefix(top) ?: top, topScore]];
+    if (second.length) [candidateParts addObject:[NSString stringWithFormat:@"%@:%0.2f", sn_language_prefix(second) ?: second, secondScore]];
+    if (third.length) [candidateParts addObject:[NSString stringWithFormat:@"%@:%0.2f", sn_language_prefix(third) ?: third, thirdScore]];
+    if (diagnostic) *diagnostic = [[NSString stringWithFormat:@"chars=%lu words=%lu candidates=%@ system=%@ chosen=%@ reason=%@",
+                                   (unsigned long)letterCount, (unsigned long)wordCount,
+                                   candidateParts.count ? [candidateParts componentsJoinedByString:@","] : @"-",
+                                   systemLanguage, finalLanguage, (reason && *reason) ? *reason : @"unknown"] copy];
 
     if (detectedLanguage && detected.length > 0) *detectedLanguage = [detected copy];
     [recognizer release];
@@ -1031,17 +1066,22 @@ static inline BOOL SN_CurrentRouteHasTrustedWiredAudio(NSArray *trustedDevices) 
             BOOL matched = NO;
             for (NSDictionary *entry in trustedDevices) {
                 if (![entry isKindOfClass:NSDictionary.class]) continue;
-                if ([entry[@"portType"] isKindOfClass:NSString.class] &&
-                    [entry[@"uid"] isKindOfClass:NSString.class] &&
-                    [entry[@"portType"] isEqualToString:output.portType] &&
-                    [entry[@"uid"] isEqualToString:output.UID]) {
+                NSString *entryType = entry[@"portType"];
+                NSString *entryUID = entry[@"uid"];
+                NSString *currentCanonicalUID = SNCanonicalWiredAudioUID(output.portType, output.UID);
+                NSString *entryCanonicalUID = SNCanonicalWiredAudioUID(entryType, entryUID);
+                if ([entryType isKindOfClass:NSString.class] &&
+                    [entryUID isKindOfClass:NSString.class] &&
+                    [SNTrustedWiredAudioPortTypeLabel(entryType) isEqualToString:SNTrustedWiredAudioPortTypeLabel(output.portType)] &&
+                    [entryCanonicalUID isEqualToString:currentCanonicalUID]) {
                     matched = YES;
                     break;
                 }
             }
             if (DBG_POLICY_ON) {
-                SNLOGFMT(@"[POLICY] trusted wired | type=%@ name=%@ uid=%@ matched=%d",
-                         output.portType, output.portName, output.UID, (int)matched);
+                SNLOGFMT(@"[POLICY] trusted wired | type=%@ name=%@ rawUID=%@ canonicalUID=%@ matched=%d",
+                         output.portType, output.portName, output.UID,
+                         SNCanonicalWiredAudioUID(output.portType, output.UID), (int)matched);
             }
             if (matched) return YES;
         }
@@ -4473,7 +4513,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.2";
+static NSString * const kReleaseInstalledVersion = @"2.1.3";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
@@ -6684,22 +6724,16 @@ static uint64_t SN_Seq = 0;
                 NSString *languageSourceText = bodySan.length ? bodySan : (title.length ? title : subtitle ?: @"");
                 NSString *detectedLanguage = nil;
                 NSString *languageReason = nil;
-                bcp47 = sn_detect_language_nl(languageSourceText, &detectedLanguage, &languageReason);
-                BOOL logFallback = ([languageReason hasPrefix:@"low-confidence-system"] ||
-                                     [languageReason isEqualToString:@"empty-source"] ||
-                                     [languageReason isEqualToString:@"no-result"] ||
-                                     [languageReason isEqualToString:@"recognizer-failure"]);
-                BOOL logOverride = [languageReason isEqualToString:@"explicit-user"];
-                if (logFallback || logOverride) {
-                    SNLOGFMT(@"[LANG] %@ | source=%@ detected=%@ final=%@ reason=%@",
-                             (logOverride ? @"override" : @"fallback"),
-                             languageSource,
-                             (detectedLanguage.length ? detectedLanguage : @"-"),
-                             (bcp47.length ? bcp47 : @"-"),
-                             (languageReason.length ? languageReason : @"unknown"));
-                }
+                NSString *languageDiagnostic = nil;
+                bcp47 = sn_detect_language_nl(languageSourceText, &detectedLanguage, &languageReason, &languageDiagnostic);
+                SNLOGFMT(@"[LANG] source=%@ %@ detected=%@ final=%@",
+                         languageSource,
+                         languageDiagnostic.length ? languageDiagnostic : @"chars=0 words=0 candidates=- system=- chosen=- reason=noCandidate",
+                         (detectedLanguage.length ? detectedLanguage : @"-"),
+                         (bcp47.length ? bcp47 : @"-"));
 #if !__has_feature(objc_arc)
                 [detectedLanguage release];
+                [languageDiagnostic release];
 #endif
             }
 
