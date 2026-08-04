@@ -23,6 +23,7 @@ NSString * const kWiredAudioDevicesKey = @"trustedWiredAudioDevices";
 NSString * const kWiredAudioDevicesV2Key = @"trustedWiredAudioDevicesV2";
 NSString * const kAllowAnyWiredAudioDeviceKey = @"allowAnyWiredAudioDevice";
 NSString * const kWiredAudioDiagnosticKey = @"wiredAudioDiagnosticPending";
+NSString * const kTrustedConnectionAliasesV1Key = @"trustedConnectionAliasesV1";
 
 NSString *SNTrustedWiredAudioPortTypeLabel(NSString *portType)
 {
@@ -51,6 +52,25 @@ BOOL SNIsUsableWiredAudioUID(NSString *uid)
         if ([value caseInsensitiveCompare:placeholder] == NSOrderedSame) return NO;
     }
     return YES;
+}
+
+NSString *SNCanonicalWiredAudioUID(NSString *portType, NSString *rawUID)
+{
+    if (![rawUID isKindOfClass:NSString.class] || rawUID.length == 0) return @"";
+    if (![portType isEqualToString:AVAudioSessionPortCarAudio]) return rawUID;
+
+    static NSRegularExpression *carPlayUIDPattern;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        carPlayUIDPattern = [[NSRegularExpression alloc] initWithPattern:
+            @"^([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}-Audio-AudioMain)-[0-9]{6,}$"
+            options:0 error:NULL];
+    });
+    NSTextCheckingResult *match = [carPlayUIDPattern firstMatchInString:rawUID
+                                                                  options:0
+                                                                    range:NSMakeRange(0, rawUID.length)];
+    if (!match || match.numberOfRanges < 2) return rawUID;
+    return [rawUID substringWithRange:[match rangeAtIndex:1]];
 }
 
 NSString *SNNormalizeVoiceLanguage(NSString *language)
