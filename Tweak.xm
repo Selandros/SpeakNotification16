@@ -20,6 +20,7 @@
 #pragma mark - Includes (System)
 
 #include <atomic>
+#include <mach/mach_time.h>
 #include <os/lock.h>
 #include <string.h>
 #include <sys/time.h>
@@ -86,6 +87,22 @@ static NSString *gLastSpeakAppCtx      = nil;
 
 static inline uint64_t SN_NowMS(void) { return (uint64_t)(CFAbsoluteTimeGetCurrent() * 1000.0); }
 
+/* Audit timestamps need durations that are stable across wall-clock changes. */
+static inline uint64_t SN_AuditNowMS(void)
+{
+    static mach_timebase_info_data_t timebase = {0, 0};
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        (void)mach_timebase_info(&timebase);
+    });
+    if (timebase.denom == 0) return 0;
+
+    uint64_t ticks = mach_continuous_time();
+    long double nanoseconds = ((long double)ticks * (long double)timebase.numer) /
+                              (long double)timebase.denom;
+    return (uint64_t)(nanoseconds / 1000000.0L);
+}
+
 #pragma mark - Timing & Policy (Global Tunables)
 
 /* ==============================  SPEAK DURATION GUARD (ms)  ==============================
@@ -111,7 +128,6 @@ static const NSUInteger kSNSiriInterTailCarPlayCapMs = 0;   // CarPlay-specific 
    Small timing tweaks around didFinish and back-to-back speaks. */
 static const NSUInteger kSNPostSpeakSoftDebounceMs   = 145;    // Soft debounce before next speak
 static const NSUInteger kSNGraceAfterFinishMs        = 130;    // Grace window after ENGINE didFinish
-static const NSUInteger kSNImmediateDebounceMs       = 150;    // Fast debounce for duplicate/rapid events
 static const NSUInteger kSNCancelButtonArmDelayMs    = 900;    // Ignore route/volume settle events right after TTS starts
 static const NSUInteger kSNPreSpeakDebounceFastMs    = 80;     // Fast debounce when notif sound disabled
 
@@ -236,17 +252,17 @@ static BOOL DEBUG_RELEASE_VERBOSE = NO; // internal Release Alerts state
 #define DBG_QUEUE_ON        (gDebugLogs || DEBUG_QUEUE)
 #define DBG_AUDIO_ON        (gDebugLogs || DEBUG_AUDIO)
 #define DBG_SOUND_ON        (gDebugLogs || DEBUG_SOUND)
-#define DBG_QUEUE_VERBOSE_ON  (DEBUG_QUEUE_VERBOSE)
-#define DBG_AUDIO_VERBOSE_ON  (DEBUG_AUDIO_VERBOSE)
-#define DBG_ENGINE_VERBOSE_ON (DEBUG_ENGINE_VERBOSE)
-#define DBG_SOUND_VERBOSE_ON  (DEBUG_SOUND_VERBOSE)
-#define DBG_VOL_VERBOSE_ON    (DEBUG_VOL)
-#define DBG_CANCEL_VERBOSE_ON (DEBUG_CANCEL)
-#define DBG_POLICY_VERBOSE_ON (DEBUG_POLICY)
-#define DBG_LANG_VERBOSE_ON   (DEBUG_LANG || DEBUG_SPEAK)
+#define DBG_QUEUE_VERBOSE_ON  (gDebugLogs || DEBUG_QUEUE_VERBOSE)
+#define DBG_AUDIO_VERBOSE_ON  (gDebugLogs || DEBUG_AUDIO_VERBOSE)
+#define DBG_ENGINE_VERBOSE_ON (gDebugLogs || DEBUG_ENGINE_VERBOSE)
+#define DBG_SOUND_VERBOSE_ON  (gDebugLogs || DEBUG_SOUND_VERBOSE)
+#define DBG_VOL_VERBOSE_ON    (gDebugLogs || DEBUG_VOL)
+#define DBG_CANCEL_VERBOSE_ON (gDebugLogs || DEBUG_CANCEL)
+#define DBG_POLICY_VERBOSE_ON (gDebugLogs || DEBUG_POLICY)
+#define DBG_LANG_VERBOSE_ON   (gDebugLogs || DEBUG_LANG || DEBUG_SPEAK)
 #define DBG_LANG_ON         (gDebugLogs || DEBUG_LANG || DEBUG_SPEAK)
 #define DBG_CALLGATE_ON     (gDebugLogs || DEBUG_CALLGATE)
-#define DBG_CALLGATE_VERBOSE_ON (DEBUG_CALLGATE)
+#define DBG_CALLGATE_VERBOSE_ON (gDebugLogs || DEBUG_CALLGATE)
 #define DBG_PRIVATE_TEXT_ON (DEBUG_PRIVATE_TEXT)
 
 // Logs only when the provided debug flag is true AND a speak context is active.
@@ -304,6 +320,7 @@ static SNBurstTracker *gBurstTracker;
 static SNDuckManager  *gDuckMgr = nil;
 static volatile BOOL gDuckChainAlive = NO;
 static std::atomic_uint64_t gCancelAllTxn{0};
+static NSString * const kSNAuditSyntheticCancelTerminalKey = @"syntheticCancelTerminal";
 
 static volatile SNDuckMode gLastDuckMode = SNDuckModeDuck;
 
@@ -394,6 +411,13 @@ static inline BOOL sn_log_once_txn(std::atomic_uint64_t &slot, uint64_t txn) {
 
 static std::atomic_bool gResumeLogged{false};
 static inline BOOL sn_audio_chain_busy_now(void);
+static inline BOOL sn_isPhoneMediaNowPlaying(void);
+static void sn_audit_playback_snapshot(uint64_t txn, NSString *name, NSString *bundleID, BOOL wasPlaying);
+static void sn_audit_resume_not_needed(uint64_t txn);
+static void sn_audit_resume_owner(uint64_t txn, NSString *name, NSString *bundleID);
+static void sn_audit_resume_handoff(uint64_t fromTxn, uint64_t toTxn);
+static void sn_audit_resume_terminal(uint64_t txn, NSString *result, NSString *name, NSString *bundleID);
+static void sn_audit_resume_terminal_with_reason(uint64_t txn, NSString *result, NSString *name, NSString *bundleID, NSString *reason);
 
 typedef NS_ENUM(uint8_t, SNResumeMethod) {
     SNResumeMethodSameController = 0,
@@ -475,6 +499,19 @@ static inline void sn_resume_state_clear_for_new_txn(uint64_t newTxn)
     uint64_t cycleTxn = gResumeCycleTxn.load(std::memory_order_acquire);
     if (!ownerTxn && !cycleTxn && !gResumeAttempted.load(std::memory_order_acquire)) return;
 
+    uint64_t auditTxn = ownerTxn ?: cycleTxn;
+    if (auditTxn && auditTxn != newTxn) {
+        BOOL resumeOwned = (gPausedBySN && gPreWasPlaying);
+        if (!resumeOwned) {
+            sn_audit_resume_terminal(auditTxn, @"notNeeded", nil, nil);
+        } else if (sn_isPhoneMediaNowPlaying()) {
+            sn_audit_resume_terminal(auditTxn, @"verified", nil, nil);
+        } else {
+            sn_audit_resume_terminal_with_reason(auditTxn, @"failed", nil, nil,
+                                                 @"newTxnStateClear");
+        }
+    }
+
     if (DBG_AUDIO_VERBOSE_ON) {
         SNLOGFMT(@"[RESUME] state clear | newTxn=%llu ownerTxn=%llu cycleTxn=%llu reason=new-txn",
                  (unsigned long long)newTxn,
@@ -484,16 +521,18 @@ static inline void sn_resume_state_clear_for_new_txn(uint64_t newTxn)
     sn_resume_state_clear(0, "new-txn");
 }
 
-static inline void sn_resume_state_handoff_to_queued_txn(uint64_t txn)
+static inline BOOL sn_resume_state_handoff_to_queued_txn(uint64_t txn)
 {
     uint64_t ownerTxn = gMediaPauseOwnerTxn.load(std::memory_order_acquire);
-    if (!txn || !ownerTxn || !gPausedBySN || !gPreWasPlaying) return;
+    if (!txn || !ownerTxn || !gPausedBySN || !gPreWasPlaying) return NO;
     gMediaPauseOwnerTxn.store(txn, std::memory_order_release);
+    sn_audit_resume_handoff(ownerTxn, txn);
     if (DBG_AUDIO_VERBOSE_ON) {
         SNLOGFMT(@"[RESUME] ownership handoff | fromTxn=%llu toTxn=%llu reason=queued-chain",
                  (unsigned long long)ownerTxn,
                  (unsigned long long)txn);
     }
+    return YES;
 }
 
 static inline void sn_log_resume_verified_once(uint64_t txn, NSString *method, NSString *bid, NSString *name, NSString *route)
@@ -611,6 +650,7 @@ static void sn_resume_verify_stage(uint64_t txn, NSString *targetBID, SNResumeMe
         NSString *bid = nil, *name = nil, *route = nil; BOOL playing = NO;
         SNAudioNowPlayingProbe(&bid, &name, &playing, &route);
         if (playing) {
+            sn_audit_resume_terminal(txn, @"verified", name, bid);
             sn_log_resume_verified_once(txn, sn_resume_method_name(method), bid, name, route);
             sn_resume_cycle_clear(YES, txn, "verified");
             return;
@@ -648,6 +688,7 @@ static void sn_resume_verify_stage(uint64_t txn, NSString *targetBID, SNResumeMe
                      sn_resume_method_name(method),
                      (targetBID.length ? targetBID : @"-"));
         }
+        sn_audit_resume_terminal(txn, @"failed", name, bid);
         sn_resume_cycle_clear(NO, txn, "final-failure");
     });
 }
@@ -659,6 +700,1052 @@ static std::atomic_uint64_t gSpeakTxnSeq{0};
 static inline uint64_t sn_new_txn(void){ return ++gSpeakTxnSeq; }
 static std::atomic_uint64_t gStartInFlightTxn{0};
 static std::atomic_bool     gQueueDrainInFlight{false};
+
+/* Audit state is keyed by the real TTS transaction. It carries metadata only;
+   notification text is never stored here. */
+static os_unfair_lock gSNAuditLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary *gSNAuditIntakeRecords = nil;
+static NSMutableArray *gSNAuditIntakeOrder = nil;
+static NSMutableDictionary *gSNAuditTxnToIntakeKeys = nil;
+static NSString * const kSNAuditSeparator = @"--------------------------------------------------------------------------------";
+static const NSUInteger kSNAuditIntakeRecordLimit = 256;
+
+static NSString *sn_audit_key(uint64_t txn)
+{
+    return [NSString stringWithFormat:@"%llu", (unsigned long long)txn];
+}
+
+static NSString *sn_audit_intake_key(uint64_t sequence)
+{
+    return [NSString stringWithFormat:@"%llu", (unsigned long long)sequence];
+}
+
+static void sn_audit_prune_locked(void)
+{
+    while (gSNAuditIntakeOrder.count > kSNAuditIntakeRecordLimit) {
+        NSString *evictionKey = nil;
+        for (NSString *candidateKey in gSNAuditIntakeOrder) {
+            NSDictionary *candidate = gSNAuditIntakeRecords[candidateKey];
+            BOOL terminalWithoutTxn = [candidate[@"terminalWithoutTxn"] boolValue];
+            BOOL separatorLogged = [candidate[@"separatorLogged"] boolValue];
+            if ([candidate[@"terminal"] boolValue] &&
+                (!terminalWithoutTxn || separatorLogged || !DBG_NOTIF_ON)) {
+                evictionKey = candidateKey;
+                break;
+            }
+        }
+        if (!evictionKey) break;
+        NSDictionary *evicted = gSNAuditIntakeRecords[evictionKey];
+        NSString *txnKey = [evicted[@"txnKey"] isKindOfClass:NSString.class] ? evicted[@"txnKey"] : nil;
+        if (txnKey.length) [gSNAuditTxnToIntakeKeys removeObjectForKey:txnKey];
+        [gSNAuditIntakeRecords removeObjectForKey:evictionKey];
+        [gSNAuditIntakeOrder removeObject:evictionKey];
+    }
+}
+
+/* Intake records establish a stable notification identity before a TTS
+   transaction exists. Later journal phases may link the record to a txn. */
+static void sn_audit_begin_intake(uint64_t sequence, NSDictionary *initial)
+{
+    if (!sequence) return;
+    NSMutableDictionary *record = [initial mutableCopy] ?: [[NSMutableDictionary alloc] init];
+    record[@"seq"] = @(sequence);
+    record[@"intakeMs"] = @(SN_AuditNowMS());
+    record[@"txn"] = [NSNull null];
+    record[@"state"] = @"intake";
+    record[@"terminal"] = @NO;
+    record[@"notifLogged"] = @NO;
+    record[@"resultLogged"] = @NO;
+    record[@"resultFinalizing"] = @NO;
+    record[@"separatorLogged"] = @NO;
+    record[@"started"] = @NO;
+    record[@"speechStartMs"] = @0;
+    record[@"routeAtSpeechStart"] = @"notStarted";
+    record[@"routeAtFinalResult"] = @"";
+    record[@"engineTerminalReceived"] = @NO;
+
+    NSString *key = sn_audit_intake_key(sequence);
+    os_unfair_lock_lock(&gSNAuditLock);
+    if (!gSNAuditIntakeRecords) gSNAuditIntakeRecords = [[NSMutableDictionary alloc] init];
+    if (!gSNAuditIntakeOrder) gSNAuditIntakeOrder = [[NSMutableArray alloc] init];
+    if (!gSNAuditIntakeRecords[key]) [gSNAuditIntakeOrder addObject:key];
+    gSNAuditIntakeRecords[key] = record;
+    sn_audit_prune_locked();
+    os_unfair_lock_unlock(&gSNAuditLock);
+    [record release];
+}
+
+static uint64_t sn_audit_sequence_for_txn(uint64_t txn)
+{
+    if (!txn) return 0;
+    uint64_t sequence = 0;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    sequence = [gSNAuditIntakeRecords[intakeKey][@"seq"] unsignedLongLongValue];
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return sequence;
+}
+
+static BOOL sn_audit_queue_item_matches(uint64_t txn, uint64_t sequence)
+{
+    if (!txn || !sequence) return NO;
+    BOOL matched = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *txnKey = sn_audit_key(txn);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[txnKey];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if ([record[@"seq"] unsignedLongLongValue] == sequence) {
+        record[@"queueIdentityVerified"] = @YES;
+        matched = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return matched;
+}
+
+static BOOL sn_audit_record_enqueue(uint64_t txn,
+                                    uint64_t sequence,
+                                    NSUInteger position,
+                                    uint64_t behindTxn,
+                                    const char *reason)
+{
+    if (!txn || !sequence) return NO;
+    BOOL recorded = NO;
+    NSString *reasonString = reason ? [NSString stringWithUTF8String:reason] : @"unknown";
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *txnKey = sn_audit_key(txn);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[txnKey];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if ([record[@"seq"] unsignedLongLongValue] == sequence) {
+        record[@"queue"] = [NSString stringWithFormat:@"enqueued(position=%lu,behindTxn=%llu,reason=%@)",
+                            (unsigned long)position,
+                            (unsigned long long)behindTxn,
+                            reasonString];
+        record[@"queueDecision"] = @"enqueued";
+        record[@"originalQueueDecision"] = @"enqueued";
+        record[@"queuePositionAtEnqueue"] = @(position);
+        record[@"queueOwnerTxn"] = @(behindTxn);
+        record[@"enqueueReason"] = reasonString;
+        record[@"enqueueMs"] = @(SN_AuditNowMS());
+        record[@"action"] = @"queue";
+        record[@"result"] = @"enqueued";
+        record[@"policy"] = @"pendingUntilStart";
+        record[@"voiceName"] = @"pendingUntilStart";
+        record[@"voiceIdentifier"] = @"-";
+        record[@"voiceSource"] = @"pending";
+        record[@"voiceQuality"] = @"-";
+        recorded = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return recorded;
+}
+
+static BOOL sn_audit_record_direct(uint64_t txn)
+{
+    if (!txn) return NO;
+    BOOL shouldEmit = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    NSString *originalQueueDecision = [record[@"originalQueueDecision"] isKindOfClass:NSString.class]
+        ? record[@"originalQueueDecision"] : nil;
+    if (record && ![originalQueueDecision isEqualToString:@"enqueued"]) {
+        if (originalQueueDecision.length == 0) {
+            record[@"queue"] = @"direct";
+            record[@"queueDecision"] = @"direct";
+            record[@"originalQueueDecision"] = @"direct";
+            record[@"decisionMs"] = @(SN_AuditNowMS());
+            record[@"action"] = @"speak";
+            record[@"result"] = @"allow";
+            record[@"voiceName"] = @"pendingUntilStart";
+            record[@"voiceIdentifier"] = @"-";
+            record[@"voiceSource"] = @"pending";
+            record[@"voiceQuality"] = @"-";
+        }
+        shouldEmit = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return shouldEmit;
+}
+
+static void sn_audit_begin(uint64_t txn, uint64_t sequence, NSDictionary *initial)
+{
+    if (!txn || !sequence) return;
+    NSString *txnKey = sn_audit_key(txn);
+    NSString *intakeKey = sn_audit_intake_key(sequence);
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record) {
+        [record addEntriesFromDictionary:initial ?: @{}];
+        record[@"txn"] = @(txn);
+        record[@"txnKey"] = txnKey;
+        record[@"txnAssignedMs"] = @(SN_AuditNowMS());
+        record[@"state"] = @"txnAssigned";
+        if (!record[@"playbackApp"]) record[@"playbackApp"] = @"-";
+        if (!record[@"playbackBundleID"]) record[@"playbackBundleID"] = @"-";
+        if (!record[@"preWasPlaying"]) record[@"preWasPlaying"] = @NO;
+        if (!record[@"pausedByUs"]) record[@"pausedByUs"] = @NO;
+        if (!record[@"pauseMs"]) record[@"pauseMs"] = @0;
+        if (!record[@"resumeNeeded"]) record[@"resumeNeeded"] = @NO;
+        if (!record[@"resumeOriginTxn"]) record[@"resumeOriginTxn"] = @0;
+        if (!record[@"resumeOwnerTxn"]) record[@"resumeOwnerTxn"] = @0;
+        if (!record[@"resumeHandoffTxn"]) record[@"resumeHandoffTxn"] = @0;
+        if (!record[@"resumeResult"]) record[@"resumeResult"] = @"pending";
+        if (!record[@"resumeTerminal"]) record[@"resumeTerminal"] = @NO;
+        if (!record[@"resumeTerminalMs"]) record[@"resumeTerminalMs"] = @0;
+        if (!record[@"inheritedPlaybackChain"]) record[@"inheritedPlaybackChain"] = @NO;
+        if (!record[@"cancelAccepted"]) record[@"cancelAccepted"] = @NO;
+        if (!record[@"cancelSource"]) record[@"cancelSource"] = @"-";
+        if (!record[@"cancelDetail"]) record[@"cancelDetail"] = @"-";
+        if (!record[@"cancelAction"]) record[@"cancelAction"] = @"-";
+        if (!record[@"cancelMs"]) record[@"cancelMs"] = @0;
+        if (!gSNAuditTxnToIntakeKeys) gSNAuditTxnToIntakeKeys = [[NSMutableDictionary alloc] init];
+        gSNAuditTxnToIntakeKeys[txnKey] = intakeKey;
+    }
+    sn_audit_prune_locked();
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_update(uint64_t txn, NSDictionary *changes)
+{
+    if (!txn || !changes.count) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *state = gSNAuditIntakeRecords[intakeKey];
+    if (state) [state addEntriesFromDictionary:changes];
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_update_sequence(uint64_t sequence, NSDictionary *changes)
+{
+    if (!sequence || !changes.count) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *state = gSNAuditIntakeRecords[sn_audit_intake_key(sequence)];
+    if (state) [state addEntriesFromDictionary:changes];
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_try_finalize_result(uint64_t txn);
+
+/* Engine state is recorded independently from legacy result emission. */
+static void sn_audit_record_engine_start(uint64_t txn, NSString *route)
+{
+    if (!txn) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && ![record[@"started"] boolValue]) {
+        uint64_t now = SN_AuditNowMS();
+        NSString *actualRoute = route.length ? route : @"-";
+        record[@"started"] = @YES;
+        record[@"speechStartMs"] = @(now);
+        record[@"startedMs"] = @(now);
+        record[@"routeAtSpeechStart"] = actualRoute;
+        record[@"route"] = actualRoute;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+/* The first accepted engine terminal callback owns terminal audit state. */
+static void sn_audit_record_engine_terminal(uint64_t txn,
+                                            NSString *outcome,
+                                            NSString *reason,
+                                            NSString *route)
+{
+    if (!txn) return;
+    BOOL recorded = NO;
+    BOOL deferEmptyRejection = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && ![record[@"engineTerminalReceived"] boolValue]) {
+        NSString *actualRoute = route.length ? route : @"-";
+        record[@"engineTerminalReceived"] = @YES;
+        record[@"engineOutcome"] = outcome ?: @"unknown";
+        record[@"engineReason"] = reason ?: @"unknown";
+        record[@"engineTerminalMs"] = @(SN_AuditNowMS());
+        record[@"routeAtEngineTerminal"] = actualRoute;
+        record[@"routeEnd"] = actualRoute;
+        if (![record[@"started"] boolValue]) {
+            record[@"started"] = @NO;
+            record[@"speechStartMs"] = @0;
+            record[@"routeAtSpeechStart"] = @"notStarted";
+        }
+        recorded = YES;
+        deferEmptyRejection = [outcome isEqualToString:@"cancelled"] && [reason isEqualToString:@"empty"];
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (recorded && !deferEmptyRejection) sn_audit_try_finalize_result(txn);
+}
+
+/* The current synchronous rejection path is an empty utterance wakeup. */
+static void sn_audit_record_engine_rejection(uint64_t txn, NSString *route)
+{
+    if (!txn) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    NSString *priorOutcome = record[@"engineOutcome"];
+    NSString *priorReason = record[@"engineReason"];
+    BOOL replaceEmptyWakeup = [record[@"engineTerminalReceived"] boolValue] &&
+        ![record[@"started"] boolValue] &&
+        [priorOutcome isEqualToString:@"cancelled"] &&
+        [priorReason isEqualToString:@"empty"];
+    if (record && (!record[@"engineTerminalReceived"] || replaceEmptyWakeup)) {
+        NSString *actualRoute = route.length ? route : @"-";
+        record[@"engineTerminalReceived"] = @YES;
+        record[@"engineOutcome"] = @"engineRejected";
+        record[@"engineReason"] = @"empty";
+        record[@"engineTerminalMs"] = @(SN_AuditNowMS());
+        record[@"routeAtEngineTerminal"] = actualRoute;
+        record[@"routeEnd"] = actualRoute;
+        record[@"started"] = @NO;
+        record[@"speechStartMs"] = @0;
+        record[@"routeAtSpeechStart"] = @"notStarted";
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+/* Volume audit records observed ownership without changing volume policy. */
+static void sn_audit_volume_prepare(uint64_t txn, float pre, float target, BOOL willSet, BOOL ownsRestore)
+{
+    if (!txn) return;
+    BOOL terminalRecorded = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && !record[@"volumeResult"]) {
+        record[@"volumeOwned"] = @(ownsRestore && willSet);
+        record[@"volumeOriginTxn"] = ownsRestore && willSet ? @(txn) : @0;
+        record[@"volumeOwnerTxn"] = ownsRestore && willSet ? @(txn) : @0;
+        record[@"volumePre"] = @(pre);
+        if (willSet) {
+            record[@"volumeTarget"] = @(target);
+        } else {
+            [record removeObjectForKey:@"volumeTarget"];
+        }
+        record[@"volumeChangedByUs"] = @NO;
+        if (!willSet) {
+            record[@"volumeFinal"] = @(pre);
+            record[@"volumeResult"] = @"unchanged";
+            record[@"volumeTerminal"] = @YES;
+            record[@"volumeTerminalMs"] = @(SN_AuditNowMS());
+            terminalRecorded = YES;
+        } else if (!ownsRestore) {
+            record[@"volumeResult"] = @"notOwned";
+            record[@"volumeTerminal"] = @YES;
+            record[@"volumeTerminalMs"] = @(SN_AuditNowMS());
+            terminalRecorded = YES;
+        } else {
+            record[@"volumeResult"] = @"pending";
+            record[@"volumeTerminal"] = @NO;
+        }
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (terminalRecorded) sn_audit_try_finalize_result(txn);
+}
+
+static void sn_audit_volume_capture(uint64_t txn, float pre, float target)
+{
+    if (!txn) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && ![record[@"volumeTerminal"] boolValue]) {
+        record[@"volumeOwned"] = @YES;
+        record[@"volumeOriginTxn"] = @(txn);
+        record[@"volumeOwnerTxn"] = @(txn);
+        record[@"volumePre"] = @(pre);
+        record[@"volumeTarget"] = @(target);
+        record[@"volumeCaptureMs"] = @(SN_AuditNowMS());
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_volume_set_requested(uint64_t txn, float target, BOOL restoring)
+{
+    if (!txn) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record) {
+        record[@"volumeSetMs"] = @(SN_AuditNowMS());
+        if (restoring) {
+            record[@"volumeRestoreTarget"] = @(target);
+        } else {
+            record[@"volumeTarget"] = @(target);
+        }
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_volume_set_confirmed(uint64_t txn, float current, float target)
+{
+    if (!txn || fabsf(current - target) > kSNVolumeRestoreGuardEps) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record) record[@"volumeChangedByUs"] = @YES;
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_volume_terminal(uint64_t txn, NSString *result, float finalVolume)
+{
+    if (!txn) return;
+    BOOL recorded = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && ![record[@"volumeTerminal"] boolValue]) {
+        record[@"volumeFinal"] = @(finalVolume);
+        record[@"volumeResult"] = result ?: @"unknown";
+        record[@"volumeTerminal"] = @YES;
+        record[@"volumeTerminalMs"] = @(SN_AuditNowMS());
+        recorded = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (recorded) sn_audit_try_finalize_result(txn);
+}
+
+static void sn_audit_volume_no_capture(uint64_t txn, float current)
+{
+    if (!txn) return;
+    BOOL recorded = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && !record[@"volumeResult"]) {
+        record[@"volumeOwned"] = @NO;
+        record[@"volumeFinal"] = @(current);
+        record[@"volumeResult"] = @"noCapture";
+        record[@"volumeTerminal"] = @YES;
+        record[@"volumeTerminalMs"] = @(SN_AuditNowMS());
+        recorded = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (recorded) sn_audit_try_finalize_result(txn);
+}
+
+static void sn_audit_volume_handoff(uint64_t fromTxn,
+                                    uint64_t toTxn,
+                                    uint64_t originTxn,
+                                    float pre,
+                                    float target)
+{
+    if (!fromTxn || !toTxn || !originTxn) return;
+    BOOL fromTerminal = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *from = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(fromTxn)]];
+    NSMutableDictionary *to = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(toTxn)]];
+    uint64_t now = SN_AuditNowMS();
+    NSNumber *captureMs = from[@"volumeCaptureMs"];
+    NSNumber *setMs = from[@"volumeSetMs"];
+    NSNumber *changedByUs = from[@"volumeChangedByUs"] ?: @NO;
+    if (from && ![from[@"volumeTerminal"] boolValue]) {
+        from[@"volumeOwned"] = @YES;
+        from[@"volumeOriginTxn"] = @(originTxn);
+        from[@"volumeOwnerTxn"] = @(toTxn);
+        from[@"volumeHandoffTxn"] = @(toTxn);
+        from[@"volumeResult"] = @"handedOff";
+        from[@"volumeTerminal"] = @YES;
+        from[@"volumeTerminalMs"] = @(now);
+        fromTerminal = YES;
+    }
+    if (to) {
+        to[@"volumeOwned"] = @YES;
+        to[@"volumeOriginTxn"] = @(originTxn);
+        to[@"volumeOwnerTxn"] = @(toTxn);
+        to[@"volumeInherited"] = @YES;
+        to[@"volumePre"] = @(pre);
+        to[@"volumeTarget"] = @(target);
+        to[@"volumeChangedByUs"] = changedByUs;
+        if (captureMs) to[@"volumeCaptureMs"] = captureMs;
+        if (setMs) to[@"volumeSetMs"] = setMs;
+        to[@"volumeResult"] = @"pending";
+        to[@"volumeTerminal"] = @NO;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (fromTerminal) sn_audit_try_finalize_result(fromTxn);
+}
+
+/* Playback audit follows existing pause ownership and verification state. */
+static void sn_audit_playback_snapshot(uint64_t txn, NSString *name, NSString *bundleID, BOOL wasPlaying)
+{
+    if (!txn) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(txn)]];
+    if (record) {
+        record[@"playbackApp"] = name.length ? name : @"-";
+        record[@"playbackBundleID"] = bundleID.length ? bundleID : @"-";
+        record[@"preWasPlaying"] = @(wasPlaying);
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_resume_not_needed(uint64_t txn)
+{
+    if (!txn) return;
+    BOOL recorded = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(txn)]];
+    if (record && ![record[@"resumeTerminal"] boolValue] &&
+        [record[@"resumeResult"] isEqualToString:@"pending"]) {
+        record[@"pausedByUs"] = @NO;
+        record[@"resumeNeeded"] = @NO;
+        record[@"resumeResult"] = @"notNeeded";
+        record[@"resumeTerminal"] = @YES;
+        record[@"resumeTerminalMs"] = @(SN_AuditNowMS());
+        recorded = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (recorded) sn_audit_try_finalize_result(txn);
+}
+
+static void sn_audit_resume_owner(uint64_t txn, NSString *name, NSString *bundleID)
+{
+    if (!txn) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(txn)]];
+    if (record && ![record[@"resumeTerminal"] boolValue]) {
+        record[@"playbackApp"] = name.length ? name : (record[@"playbackApp"] ?: @"-");
+        record[@"playbackBundleID"] = bundleID.length ? bundleID : (record[@"playbackBundleID"] ?: @"-");
+        record[@"preWasPlaying"] = @YES;
+        record[@"pausedByUs"] = @YES;
+        record[@"pauseMs"] = @(SN_AuditNowMS());
+        record[@"resumeNeeded"] = @YES;
+        record[@"resumeOriginTxn"] = @(txn);
+        record[@"resumeOwnerTxn"] = @(txn);
+        record[@"resumeResult"] = @"pending";
+        record[@"resumeTerminal"] = @NO;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+static void sn_audit_resume_handoff(uint64_t fromTxn, uint64_t toTxn)
+{
+    if (!fromTxn || !toTxn) return;
+    BOOL fromTerminal = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *from = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(fromTxn)]];
+    NSMutableDictionary *to = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(toTxn)]];
+    uint64_t originTxn = [from[@"resumeOriginTxn"] unsignedLongLongValue] ?: fromTxn;
+    uint64_t now = SN_AuditNowMS();
+    if (from && ![from[@"resumeTerminal"] boolValue]) {
+        from[@"resumeNeeded"] = @YES;
+        from[@"resumeOriginTxn"] = @(originTxn);
+        from[@"resumeOwnerTxn"] = @(toTxn);
+        from[@"resumeHandoffTxn"] = @(toTxn);
+        from[@"resumeResult"] = @"handedOff";
+        from[@"resumeTerminal"] = @YES;
+        from[@"resumeTerminalMs"] = @(now);
+        fromTerminal = YES;
+    }
+    if (to && ![to[@"resumeTerminal"] boolValue]) {
+        to[@"playbackApp"] = from[@"playbackApp"] ?: @"-";
+        to[@"playbackBundleID"] = from[@"playbackBundleID"] ?: @"-";
+        to[@"preWasPlaying"] = from[@"preWasPlaying"] ?: @YES;
+        to[@"pausedByUs"] = @YES;
+        to[@"pauseMs"] = from[@"pauseMs"] ?: @(now);
+        to[@"inheritedPlaybackChain"] = @YES;
+        to[@"resumeNeeded"] = @YES;
+        to[@"resumeOriginTxn"] = @(originTxn);
+        to[@"resumeOwnerTxn"] = @(toTxn);
+        to[@"resumeResult"] = @"pending";
+        to[@"resumeTerminal"] = @NO;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (fromTerminal) sn_audit_try_finalize_result(fromTxn);
+}
+
+static void sn_audit_resume_terminal_with_reason(uint64_t txn,
+                                                  NSString *result,
+                                                  NSString *name,
+                                                  NSString *bundleID,
+                                                  NSString *reason)
+{
+    if (!txn) return;
+    BOOL recorded = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(txn)]];
+    if (record && ![record[@"resumeTerminal"] boolValue]) {
+        if (name.length) record[@"playbackApp"] = name;
+        if (bundleID.length) record[@"playbackBundleID"] = bundleID;
+        record[@"resumeResult"] = result ?: @"failed";
+        if (reason.length) record[@"resumeReason"] = reason;
+        record[@"resumeTerminal"] = @YES;
+        record[@"resumeTerminalMs"] = @(SN_AuditNowMS());
+        recorded = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (recorded) sn_audit_try_finalize_result(txn);
+}
+
+static void sn_audit_resume_terminal(uint64_t txn, NSString *result, NSString *name, NSString *bundleID)
+{
+    sn_audit_resume_terminal_with_reason(txn, result, name, bundleID, nil);
+}
+
+/* Queue removal is journal-only. It never substitutes for an engine terminal. */
+static void sn_audit_record_queue_terminal(uint64_t txn,
+                                           uint64_t sequence,
+                                           NSString *outcome,
+                                           NSString *reason)
+{
+    if (!txn || !sequence) return;
+    BOOL recorded = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && [record[@"seq"] unsignedLongLongValue] == sequence &&
+        ![record[@"started"] boolValue] &&
+        ![record[@"queueTerminalReceived"] boolValue]) {
+        uint64_t now = SN_AuditNowMS();
+        record[@"queueTerminalReceived"] = @YES;
+        record[@"queueTerminalOutcome"] = outcome.length ? outcome : @"dropped";
+        record[@"queueTerminalReason"] = reason.length ? reason : @"unknown";
+        record[@"queueTerminalMs"] = @(now);
+        record[@"started"] = @NO;
+        record[@"speechStartMs"] = @0;
+        record[@"routeAtSpeechStart"] = @"notStarted";
+
+        if (![record[@"volumeTerminal"] boolValue] &&
+            ![record[@"volumeOwned"] boolValue]) {
+            record[@"volumeResult"] = @"notOwned";
+            record[@"volumeTerminal"] = @YES;
+            record[@"volumeTerminalMs"] = @(now);
+        }
+
+        if (![record[@"resumeTerminal"] boolValue] &&
+            ![record[@"resumeNeeded"] boolValue] &&
+            ![record[@"inheritedPlaybackChain"] boolValue]) {
+            record[@"pausedByUs"] = @NO;
+            record[@"resumeNeeded"] = @NO;
+            record[@"resumeResult"] = @"notNeeded";
+            record[@"resumeTerminal"] = @YES;
+            record[@"resumeTerminalMs"] = @(now);
+        }
+        recorded = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (recorded) sn_audit_try_finalize_result(txn);
+}
+
+/* The first accepted cancellation is authoritative for the transaction. */
+static void sn_audit_record_cancel_accepted(uint64_t txn,
+                                            NSString *source,
+                                            NSString *detail,
+                                            NSString *action)
+{
+    if (!txn) return;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(txn)]];
+    if (record && ![record[@"cancelAccepted"] boolValue]) {
+        record[@"cancelAccepted"] = @YES;
+        record[@"cancelSource"] = source.length ? source : @"-";
+        record[@"cancelDetail"] = detail.length ? detail : @"-";
+        record[@"cancelAction"] = action.length ? action : @"cancel";
+        record[@"cancelMs"] = @(SN_AuditNowMS());
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+}
+
+/* Accept only the explicit SN_CancelAll terminal for its exact active record. */
+static BOOL sn_audit_can_accept_synthetic_cancel_terminal(uint64_t txn)
+{
+    if (!txn || gCancelAllTxn.load(std::memory_order_acquire) != txn) return NO;
+    BOOL accepted = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *txnKey = sn_audit_key(txn);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[txnKey];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && [record[@"txn"] unsignedLongLongValue] == txn &&
+        [record[@"cancelAccepted"] boolValue] &&
+        ![record[@"engineTerminalReceived"] boolValue] &&
+        ![record[@"resultLogged"] boolValue] &&
+        ![record[@"resultFinalizing"] boolValue]) {
+        accepted = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return accepted;
+}
+
+static NSDictionary *sn_audit_snapshot(uint64_t txn, BOOL markNotification)
+{
+    if (!txn) return nil;
+    NSDictionary *copy = nil;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *state = gSNAuditIntakeRecords[intakeKey];
+    BOOL alreadyMarked = [state[@"notifLogged"] boolValue];
+    if (state && !alreadyMarked) {
+        if (markNotification) state[@"notifLogged"] = @YES;
+        copy = [state copy];
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return [copy autorelease];
+}
+
+/* Result helpers are audit-only preparation for the later finalizer. */
+static NSDictionary *sn_audit_result_snapshot_for_txn(uint64_t txn) __attribute__((unused));
+static NSDictionary *sn_audit_result_readiness(NSDictionary *snapshot) __attribute__((unused));
+static NSString *sn_audit_format_result_snapshot(NSDictionary *snapshot,
+                                                  uint64_t resultEmissionMs) __attribute__((unused));
+
+static NSDictionary *sn_audit_result_snapshot_for_txn(uint64_t txn)
+{
+    if (!txn) return nil;
+    static NSArray<NSString *> *keys = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        keys = [[NSArray alloc] initWithObjects:
+                @"seq", @"txn", @"receivedMs", @"intakeMs", @"createdMs", @"decisionMs", @"enqueueMs",
+                @"originalQueueDecision", @"queuePositionAtEnqueue", @"queueOwnerTxn", @"enqueueReason",
+                @"queueTerminalReceived", @"queueTerminalOutcome", @"queueTerminalReason", @"queueTerminalMs",
+                @"started", @"speechStartMs", @"routeAtSpeechStart", @"engineTerminalReceived",
+                @"engineOutcome", @"engineReason", @"engineTerminalMs", @"routeAtEngineTerminal",
+                @"routeAtFinalResult", @"lang", @"langReason", @"langDiagnostic", @"voiceName", @"voiceIdentifier",
+                @"voiceSource", @"voiceQuality", @"policy", @"inheritedPlaybackChain", @"volumeOwned",
+                @"volumeOriginTxn", @"volumeOwnerTxn", @"volumePre", @"volumeTarget", @"volumeRestoreTarget", @"volumeFinal",
+                @"volumeChangedByUs", @"volumeResult", @"volumeHandoffTxn", @"volumeTerminal",
+                @"volumeTerminalMs", @"playbackApp", @"playbackBundleID", @"preWasPlaying", @"pausedByUs",
+                @"resumeNeeded", @"resumeOriginTxn", @"resumeOwnerTxn", @"resumeHandoffTxn", @"resumeResult",
+                @"resumeTerminal", @"resumeTerminalMs", @"cancelAccepted", @"cancelSource", @"cancelDetail",
+                @"cancelAction", @"cancelMs", @"error", @"resultLogged", @"resultFinalizing", @"separatorLogged", nil];
+    });
+
+    NSDictionary *snapshot = nil;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record) {
+        NSMutableDictionary *filtered = [[NSMutableDictionary alloc] initWithCapacity:keys.count];
+        for (NSString *key in keys) {
+            id value = record[key];
+            if (value) filtered[key] = value;
+        }
+        if (!filtered[@"txn"]) filtered[@"txn"] = @(txn);
+        if (filtered[@"seq"]) filtered[@"notificationNumber"] = filtered[@"seq"];
+        if (!filtered[@"resultLogged"]) filtered[@"resultLogged"] = @NO;
+        if (!filtered[@"separatorLogged"]) filtered[@"separatorLogged"] = @NO;
+        snapshot = [filtered copy];
+        [filtered release];
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return [snapshot autorelease];
+}
+
+static uint64_t sn_audit_snapshot_u64(NSDictionary *snapshot, NSString *key)
+{
+    id value = snapshot[key];
+    return [value respondsToSelector:@selector(unsignedLongLongValue)] ? [value unsignedLongLongValue] : 0;
+}
+
+static NSString *sn_audit_snapshot_string(NSDictionary *snapshot, NSString *key, NSString *fallback)
+{
+    id value = snapshot[key];
+    return [value isKindOfClass:NSString.class] && [(NSString *)value length] ? value : fallback;
+}
+
+static BOOL sn_audit_result_value_is_terminal(NSDictionary *snapshot,
+                                               NSString *terminalKey,
+                                               NSString *resultKey)
+{
+    NSString *result = sn_audit_snapshot_string(snapshot, resultKey, nil);
+    return [snapshot[terminalKey] boolValue] && result.length > 0 && ![result isEqualToString:@"pending"];
+}
+
+static NSDictionary *sn_audit_result_readiness(NSDictionary *snapshot)
+{
+    NSMutableArray<NSString *> *blockers = [[NSMutableArray alloc] init];
+    BOOL started = [snapshot[@"started"] boolValue];
+    BOOL queueTerminal = [snapshot[@"queueTerminalReceived"] boolValue] && !started;
+    BOOL engineTerminal = [snapshot[@"engineTerminalReceived"] boolValue];
+
+    if (!snapshot) {
+        [blockers addObject:@"missingRecord"];
+    } else if ([snapshot[@"resultLogged"] boolValue]) {
+        [blockers addObject:@"alreadyFinalized"];
+    } else {
+        if (!engineTerminal && !queueTerminal) [blockers addObject:@"noTerminal"];
+        if (!sn_audit_result_value_is_terminal(snapshot, @"volumeTerminal", @"volumeResult")) {
+            [blockers addObject:@"volumePending"];
+        }
+        if (!sn_audit_result_value_is_terminal(snapshot, @"resumeTerminal", @"resumeResult")) {
+            [blockers addObject:@"resumePending"];
+        }
+    }
+
+    NSArray *blockerSnapshot = [blockers copy];
+    NSDictionary *readiness = [[NSDictionary alloc] initWithObjectsAndKeys:
+                               @([blockers count] == 0), @"ready",
+                               blockerSnapshot, @"blockers",
+                               (queueTerminal ? @"queue" : (engineTerminal ? @"engine" : @"none")), @"terminalBasis",
+                               nil];
+    [blockerSnapshot release];
+    [blockers release];
+    return [readiness autorelease];
+}
+
+static NSString *sn_audit_elapsed_text(uint64_t endMs, uint64_t startMs)
+{
+    if (!endMs || !startMs) return @"-";
+    if (endMs < startMs) return @"invalid";
+    return [NSString stringWithFormat:@"%llu", (unsigned long long)(endMs - startMs)];
+}
+
+static NSString *sn_audit_volume_text(NSDictionary *snapshot)
+{
+    NSString *result = sn_audit_snapshot_string(snapshot, @"volumeResult", @"pending");
+    if ([result isEqualToString:@"notOwned"] || [result isEqualToString:@"noCapture"]) return result;
+    if ([result isEqualToString:@"handedOff"]) {
+        return [NSString stringWithFormat:@"handedOff(toTxn=%llu,originTxn=%llu)",
+                (unsigned long long)sn_audit_snapshot_u64(snapshot, @"volumeHandoffTxn"),
+                (unsigned long long)sn_audit_snapshot_u64(snapshot, @"volumeOriginTxn")];
+    }
+    NSNumber *preValue = [snapshot[@"volumePre"] isKindOfClass:NSNumber.class] ? snapshot[@"volumePre"] : nil;
+    NSNumber *targetValue = [snapshot[@"volumeTarget"] isKindOfClass:NSNumber.class] ? snapshot[@"volumeTarget"] : nil;
+    NSNumber *finalValue = [snapshot[@"volumeFinal"] isKindOfClass:NSNumber.class] ? snapshot[@"volumeFinal"] : nil;
+    NSString *pre = preValue ? [NSString stringWithFormat:@"%.2f", preValue.doubleValue] : @"-";
+    NSString *target = targetValue ? [NSString stringWithFormat:@"%.2f", targetValue.doubleValue] : @"-";
+    NSString *final = finalValue ? [NSString stringWithFormat:@"%.2f", finalValue.doubleValue] : @"-";
+    return [NSString stringWithFormat:@"pre:%@ target:%@ final:%@ result=%@", pre, target, final, result];
+}
+
+static NSString *sn_audit_playback_text(NSDictionary *snapshot, BOOL neverStarted)
+{
+    if (neverStarted) return @"playback=notOwned pausedByUs=NO resume=notNeeded";
+    NSString *app = sn_audit_snapshot_string(snapshot, @"playbackApp", @"-");
+    NSString *resume = sn_audit_snapshot_string(snapshot, @"resumeResult", @"pending");
+    if ([resume isEqualToString:@"handedOff"]) {
+        resume = [NSString stringWithFormat:@"handedOff(toTxn=%llu)",
+                  (unsigned long long)sn_audit_snapshot_u64(snapshot, @"resumeHandoffTxn")];
+    }
+    return [NSString stringWithFormat:@"playback=%@ pausedByUs=%@ resume=%@",
+            app, [snapshot[@"pausedByUs"] boolValue] ? @"YES" : @"NO", resume];
+}
+
+static NSString *sn_audit_format_result_snapshot(NSDictionary *snapshot, uint64_t resultEmissionMs)
+{
+    if (!snapshot) return nil;
+    BOOL started = [snapshot[@"started"] boolValue];
+    BOOL neverStartedQueueTerminal = [snapshot[@"queueTerminalReceived"] boolValue] && !started;
+    NSString *outcome = neverStartedQueueTerminal
+        ? sn_audit_snapshot_string(snapshot, @"queueTerminalOutcome", @"dropped")
+        : sn_audit_snapshot_string(snapshot, @"engineOutcome", @"unknown");
+    NSString *reason = neverStartedQueueTerminal
+        ? sn_audit_snapshot_string(snapshot, @"queueTerminalReason", @"unknown")
+        : sn_audit_snapshot_string(snapshot, @"engineReason", @"unknown");
+    uint64_t terminalBasisMs = neverStartedQueueTerminal
+        ? sn_audit_snapshot_u64(snapshot, @"queueTerminalMs")
+        : sn_audit_snapshot_u64(snapshot, @"engineTerminalMs");
+    uint64_t speechStartMs = sn_audit_snapshot_u64(snapshot, @"speechStartMs");
+    uint64_t queueStartMs = neverStartedQueueTerminal
+        ? sn_audit_snapshot_u64(snapshot, @"enqueueMs")
+        : ([sn_audit_snapshot_string(snapshot, @"originalQueueDecision", @"") isEqualToString:@"enqueued"]
+           ? sn_audit_snapshot_u64(snapshot, @"enqueueMs")
+           : sn_audit_snapshot_u64(snapshot, @"decisionMs"));
+    if (!queueStartMs && !started && !neverStartedQueueTerminal) {
+        queueStartMs = sn_audit_snapshot_u64(snapshot, @"decisionMs");
+    }
+    uint64_t queueEndMs = started ? speechStartMs : terminalBasisMs;
+    NSString *queueWait = sn_audit_elapsed_text(queueEndMs, queueStartMs);
+    NSString *speechMs = started ? sn_audit_elapsed_text(terminalBasisMs, speechStartMs) : @"0";
+    NSString *cleanupMs = sn_audit_elapsed_text(resultEmissionMs, terminalBasisMs);
+    NSString *totalMs = sn_audit_elapsed_text(resultEmissionMs, sn_audit_snapshot_u64(snapshot, @"receivedMs"));
+
+    NSString *routeStart = started ? sn_audit_snapshot_string(snapshot, @"routeAtSpeechStart", @"-") : @"notStarted";
+    NSString *routeFinal = neverStartedQueueTerminal ? @"notStarted"
+        : sn_audit_snapshot_string(snapshot, @"routeAtFinalResult",
+                                   sn_audit_snapshot_string(snapshot, @"routeAtEngineTerminal", routeStart));
+    BOOL switched = started && routeStart.length && routeFinal.length && ![routeStart isEqualToString:routeFinal];
+    NSString *voice = nil;
+    NSString *voiceName = sn_audit_snapshot_string(snapshot, @"voiceName", started ? @"-" : @"pendingUntilStart");
+    if (!started && [voiceName isEqualToString:@"pendingUntilStart"]) {
+        voice = @"pendingUntilStart";
+    } else {
+        voice = [NSString stringWithFormat:@"\"%@\"<%@/%@/%@,id=%@>", voiceName,
+                 sn_audit_snapshot_string(snapshot, @"lang", @"-"),
+                 sn_audit_snapshot_string(snapshot, @"voiceQuality", @"-"),
+                 sn_audit_snapshot_string(snapshot, @"voiceSource", @"-"),
+                 sn_audit_snapshot_string(snapshot, @"voiceIdentifier", @"-")];
+    }
+    NSString *policy = sn_audit_snapshot_string(snapshot, @"policy", started ? @"-" : @"pendingUntilStart");
+    NSString *queue = sn_audit_snapshot_string(snapshot, @"originalQueueDecision", @"-");
+    NSString *cancel = @"-";
+    if ([snapshot[@"cancelAccepted"] boolValue]) {
+        NSString *source = sn_audit_snapshot_string(snapshot, @"cancelSource", @"-");
+        NSString *detail = sn_audit_snapshot_string(snapshot, @"cancelDetail", @"-");
+        if (![source isEqualToString:@"-"] && ![detail isEqualToString:@"-"]) {
+            cancel = [NSString stringWithFormat:@"%@/%@", source, detail];
+        }
+    }
+
+    NSString *route = started ? [NSString stringWithFormat:@"%@->%@", routeStart, routeFinal] : @"notStarted";
+    return [NSString stringWithFormat:@"[RESULT] %02llu | txn=%llu outcome=%@ reason=%@ started=%@ | queueWaitMs=%@ speechMs=%@ cleanupMs=%@ totalMs=%@ | lang=%@ | voice=%@ | route=%@ switched=%@ | policy=%@ inheritedPlaybackChain=%@ | queue=%@ | volume=%@ | %@ | cancel=%@ | error=%@",
+            (unsigned long long)sn_audit_snapshot_u64(snapshot, @"seq"),
+            (unsigned long long)sn_audit_snapshot_u64(snapshot, @"txn"), outcome, reason,
+            started ? @"YES" : @"NO", queueWait, speechMs, cleanupMs, totalMs,
+            sn_audit_snapshot_string(snapshot, @"lang", @"-"), voice, route,
+            switched ? @"YES" : @"NO", policy,
+            [snapshot[@"inheritedPlaybackChain"] boolValue] ? @"YES" : @"NO", queue,
+            sn_audit_volume_text(snapshot), sn_audit_playback_text(snapshot, neverStartedQueueTerminal),
+            cancel, sn_audit_snapshot_string(snapshot, @"error", @"-")];
+}
+
+/* Claims and emits the audit result only after all terminal state is present. */
+static void sn_audit_try_finalize_result(uint64_t txn)
+{
+    if (!txn) return;
+    NSDictionary *preflight = sn_audit_result_snapshot_for_txn(txn);
+    NSDictionary *readiness = sn_audit_result_readiness(preflight);
+    if (![readiness[@"ready"] boolValue]) return;
+
+    BOOL claimed = NO;
+    BOOL started = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
+    NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
+    if (record && ![record[@"resultLogged"] boolValue] && ![record[@"resultFinalizing"] boolValue]) {
+        record[@"resultFinalizing"] = @YES;
+        started = [record[@"started"] boolValue];
+        claimed = YES;
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    if (!claimed) return;
+
+    NSString *finalRoute = nil;
+    if (started) {
+        finalRoute = [[SNMediaControl lastOutputPortType] copy];
+        if (finalRoute.length) {
+            os_unfair_lock_lock(&gSNAuditLock);
+            NSMutableDictionary *routeRecord = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(txn)]];
+            if (routeRecord && [routeRecord[@"resultFinalizing"] boolValue] && ![routeRecord[@"resultLogged"] boolValue]) {
+                routeRecord[@"routeAtFinalResult"] = finalRoute;
+            }
+            os_unfair_lock_unlock(&gSNAuditLock);
+        }
+    }
+
+    NSDictionary *finalSnapshot = sn_audit_result_snapshot_for_txn(txn);
+    uint64_t resultEmissionMs = SN_AuditNowMS();
+    NSString *line = sn_audit_format_result_snapshot(finalSnapshot, resultEmissionMs);
+    BOOL wroteOutput = (DBG_ENGINE_ON && line.length > 0);
+    if (wroteOutput) {
+        SNLOGFMT(@"%@", line);
+        logRawTextIntoFile(kSNAuditSeparator);
+    }
+
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *finalRecord = gSNAuditIntakeRecords[gSNAuditTxnToIntakeKeys[sn_audit_key(txn)]];
+    if (finalRecord && [finalRecord[@"resultFinalizing"] boolValue]) {
+        finalRecord[@"resultLogged"] = @YES;
+        finalRecord[@"separatorLogged"] = @(wroteOutput);
+        finalRecord[@"terminal"] = @YES;
+        finalRecord[@"resultFinalizing"] = @NO;
+        sn_audit_prune_locked();
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    [finalRoute release];
+}
+
+static NSDictionary *sn_audit_snapshot_sequence(uint64_t sequence)
+{
+    if (!sequence) return nil;
+    NSDictionary *copy = nil;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[sn_audit_intake_key(sequence)];
+    if (record && ![record[@"notifLogged"] boolValue]) {
+        record[@"notifLogged"] = @YES;
+        copy = [record copy];
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return [copy autorelease];
+}
+
+static BOOL sn_audit_mark_separator_logged(uint64_t sequence)
+{
+    if (!sequence) return NO;
+    BOOL shouldWrite = NO;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[sn_audit_intake_key(sequence)];
+    if (record && [record[@"terminalWithoutTxn"] boolValue] &&
+        [record[@"notifLogged"] boolValue] && ![record[@"separatorLogged"] boolValue]) {
+        record[@"separatorLogged"] = @YES;
+        shouldWrite = YES;
+    }
+    sn_audit_prune_locked();
+    os_unfair_lock_unlock(&gSNAuditLock);
+    return shouldWrite;
+}
+
+static BOOL sn_audit_write_notif(NSDictionary *s, NSString *txnText)
+{
+    if (!DBG_NOTIF_ON || !s) return NO;
+    BOOL withoutTxn = [txnText isEqualToString:@"-"];
+    NSString *voiceName = s[@"voiceName"] ?: (withoutTxn ? @"notEvaluated" : @"-");
+    NSString *languageText = withoutTxn
+        ? [NSString stringWithFormat:@"reason=%@ candidates=notEvaluated", s[@"terminalReason"] ?: @"notEvaluated"]
+        : (s[@"langDiagnostic"] ?: @"chars=0 words=0 candidates=- system=- chosen=- reason=notEvaluated");
+    NSString *voiceText = [voiceName isEqualToString:@"notEvaluated"]
+        ? @"notEvaluated"
+        : [NSString stringWithFormat:@"%@<%@> source=%@ quality=%@",
+           voiceName,
+           s[@"voiceIdentifier"] ?: @"-",
+           s[@"voiceSource"] ?: @"-",
+           s[@"voiceQuality"] ?: @"-"];
+    SNLOGFMT(@"[NOTIF] %02llu | txn=%@ sectionID=%@ title_len=%@ subtitle_len=%@ body_len=%@ | wifi=%@ bt=%@ wired=%@ broadWired=%@ trust=%@ trustedBy=%@ callGate=%@ | route=%@ otherAudio=%@ volume=%@%% muted=%@ locked=%@ fg=%@ screen=%@ battery=%@ | sound=%@ fmt=%@ | lang=%@ %@ | policy=%@ queue=%@ action=%@ result=%@ voice=%@",
+             [s[@"seq"] unsignedLongLongValue], txnText ?: @"-",
+             s[@"sectionID"] ?: @"-", s[@"titleLen"] ?: @0, s[@"subtitleLen"] ?: @0, s[@"bodyLen"] ?: @0,
+             s[@"wifi"] ?: @"-", s[@"bluetooth"] ?: @"-", s[@"wired"] ?: @"-", s[@"broadWired"] ?: @"-",
+             s[@"trust"] ?: @"-", s[@"trustedBy"] ?: @"-", s[@"callGate"] ?: @"-",
+             s[@"route"] ?: @"-", s[@"otherAudio"] ?: @"-", s[@"volume"] ?: @"-", s[@"muted"] ?: @"-", s[@"locked"] ?: @"-",
+             s[@"foreground"] ?: @"-", s[@"screen"] ?: @"-", s[@"battery"] ?: @"-", s[@"sound"] ?: @"-",
+             s[@"format"] ?: @"-", s[@"lang"] ?: @"-", languageText, s[@"policy"] ?: @"-", s[@"queue"] ?: @"-",
+             s[@"action"] ?: @"-", s[@"result"] ?: @"-",
+             voiceText);
+    return YES;
+}
+
+static BOOL sn_audit_emit_notif(uint64_t txn)
+{
+    if (!DBG_NOTIF_ON) return NO;
+    NSDictionary *s = sn_audit_snapshot(txn, YES);
+    return sn_audit_write_notif(s, [NSString stringWithFormat:@"%llu", (unsigned long long)txn]);
+}
+
+static void sn_audit_emit_denied(NSDictionary *s, NSString *reason)
+{
+    if (!s) return;
+    uint64_t seq = [s[@"seq"] unsignedLongLongValue];
+    BOOL isDrop = [reason isEqualToString:@"burstDuplicate"];
+    NSString *terminalReason = [reason isEqualToString:@"untrusted"] ? @"noTrustedConnection" : (reason ?: @"denied");
+    NSString *soundReason = [terminalReason isEqualToString:@"noTrustedConnection"] ? @"trustDenied" : terminalReason;
+    os_unfair_lock_lock(&gSNAuditLock);
+    NSMutableDictionary *record = gSNAuditIntakeRecords[sn_audit_intake_key(seq)];
+    if (record) {
+        [record addEntriesFromDictionary:s];
+        record[@"state"] = isDrop ? @"dropped" : @"denied";
+        record[@"terminal"] = @YES;
+        record[@"terminalWithoutTxn"] = @YES;
+        record[@"terminalKind"] = isDrop ? @"drop" : @"deny";
+        record[@"terminalReason"] = terminalReason;
+        record[@"decisionMs"] = @(SN_AuditNowMS());
+        record[@"queue"] = @"none";
+        record[@"action"] = isDrop ? @"drop" : @"deny";
+        record[@"result"] = isDrop ? @"drop" : @"deny";
+        record[@"sound"] = [NSString stringWithFormat:@"notAttempted(reason=%@)", soundReason];
+        record[@"format"] = @"notEvaluated";
+        record[@"lang"] = @"notEvaluated";
+        record[@"langReason"] = @"notEvaluated";
+        record[@"langDiagnostic"] = @"notEvaluated";
+        record[@"policy"] = @"notEvaluated";
+        record[@"voiceName"] = @"notEvaluated";
+    }
+    os_unfair_lock_unlock(&gSNAuditLock);
+    NSDictionary *snapshot = sn_audit_snapshot_sequence(seq);
+    if (sn_audit_write_notif(snapshot, @"-") && sn_audit_mark_separator_logged(seq)) {
+        logRawTextIntoFile(kSNAuditSeparator);
+    }
+}
 
 static std::atomic_uint64_t gFinishOnceTxn{0};
 static std::atomic_bool     gFinishOnceDone{false};
@@ -744,7 +1831,6 @@ typedef NS_ENUM(uint8_t, SNCancelCandidateKind) {
 #pragma mark - Forward Declarations
 static void finishWork(void);
 static inline NSString *SN_CurrentSSID(void);
-static inline NSString *SN_CurrentBTName(void);
 static inline BOOL sn_isPhoneMediaNowPlaying(void);
 static inline NSString *SN_AppDisplayNameForSection(NSString *sectionID, id bulletin);
 static inline BOOL SN_PrefBoolFast(NSString *key, BOOL def);
@@ -752,18 +1838,19 @@ static inline NSString *sn_normalized_app_counter_key(NSString *bundleID);
 static void SN_CancelAll(const char *source);
 static inline BOOL sn_cancel_buttons_armed_now(void);
 static inline BOOL sn_cancel_target_active_now(void);
-static inline NSString *sn_cancel_mode_name(SNCancelButtonMode mode);
 static inline BOOL sn_cancel_mode_accepts_volume(SNCancelButtonMode mode);
 static void sn_handle_cancel_candidate(const char *source, NSString *detail, SNCancelCandidateKind kind);
+static void sn_cancel_ringer_switch(NSString *detail);
 static void sn_start_duck_chain_and_tts(NSString *title,
                                         NSString *msg,
                                         NSString *bcp47,
                                         NSString *appCtx,
                                         uint64_t txn);
 
-static void sn_queue_enqueue(NSString *title, NSString *msg, NSString *bcp47, NSString *appCtx, uint64_t txn);
+static void sn_queue_enqueue(NSString *title, NSString *msg, NSString *bcp47, NSString *appCtx,
+                             uint64_t txn, const char *reason, uint64_t behindTxn);
 static NSUInteger sn_queue_count(void);
-static void sn_queue_clear(void);
+static void sn_queue_clear(const char *reason);
 static BOOL sn_try_speak_next_from_queue(const char *reason);
 static BOOL sn_queue_finish_terminal(const char *reason, uint64_t txn);
 
@@ -1030,22 +2117,6 @@ static inline NSString *SN_CurrentSSID(void) {
     return (s.length ? s : nil);
 }
 
-static inline NSString *SN_CurrentBTName(void) {
-    @try {
-        AVAudioSessionRouteDescription *route = [AVAudioSession sharedInstance].currentRoute;
-        if (!route || route.outputs.count == 0) return nil;
-        for (AVAudioSessionPortDescription *out in route.outputs) {
-            NSString *t = out.portType ?: @"";
-            if ([t isEqualToString:AVAudioSessionPortBluetoothA2DP] ||
-                [t isEqualToString:AVAudioSessionPortBluetoothHFP] ||
-                [t isEqualToString:AVAudioSessionPortBluetoothLE]) {
-                if (out.portName.length) return out.portName;
-            }
-        }
-    } @catch (...) {}
-    return nil;
-}
-
 static inline BOOL SN_ListContainsString(NSArray *list, NSString *needle) {
     if (!list || list.count == 0 || needle.length == 0) return NO;
     NSString *n = [needle stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -1057,90 +2128,141 @@ static inline BOOL SN_ListContainsString(NSArray *list, NSString *needle) {
     return NO;
 }
 
-static inline BOOL SN_CurrentRouteHasTrustedWiredAudio(NSArray *trustedDevices) {
-    @try {
-        AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
-        for (AVAudioSessionPortDescription *output in route.outputs) {
-            if (!SNIsTrustedWiredAudioPortType(output.portType) || output.portName.length == 0 ||
-                !SNIsUsableWiredAudioUID(output.UID)) continue;
-            BOOL matched = NO;
-            for (NSDictionary *entry in trustedDevices) {
-                if (![entry isKindOfClass:NSDictionary.class]) continue;
-                NSString *entryType = entry[@"portType"];
-                NSString *entryUID = entry[@"uid"];
-                NSString *currentCanonicalUID = SNCanonicalWiredAudioUID(output.portType, output.UID);
-                NSString *entryCanonicalUID = SNCanonicalWiredAudioUID(entryType, entryUID);
-                if ([entryType isKindOfClass:NSString.class] &&
-                    [entryUID isKindOfClass:NSString.class] &&
-                    [SNTrustedWiredAudioPortTypeLabel(entryType) isEqualToString:SNTrustedWiredAudioPortTypeLabel(output.portType)] &&
-                    [entryCanonicalUID isEqualToString:currentCanonicalUID]) {
-                    matched = YES;
-                    break;
-                }
-            }
-            if (DBG_POLICY_ON) {
-                SNLOGFMT(@"[POLICY] trusted wired | type=%@ name=%@ rawUID=%@ canonicalUID=%@ matched=%d",
-                         output.portType, output.portName, output.UID,
-                         SNCanonicalWiredAudioUID(output.portType, output.UID), (int)matched);
-            }
-            if (matched) return YES;
-        }
-    } @catch (...) {}
-    return NO;
+static NSString *SN_TrustLogString(NSString *value) {
+    if (![value isKindOfClass:NSString.class]) return @"-";
+    NSString *clean = [[value componentsSeparatedByCharactersInSet:NSCharacterSet.controlCharacterSet]
+                       componentsJoinedByString:@" "];
+    clean = [clean stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return clean.length ? clean : @"-";
 }
 
-static inline BOOL SN_CurrentRouteAllowsAnyWiredAudio(void) {
-    @try {
-        AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
-        for (AVAudioSessionPortDescription *output in route.outputs) {
-            if (SNIsTrustedWiredAudioPortType(output.portType)) return YES;
-        }
-    } @catch (...) {}
-    return NO;
+static NSString *SN_TrustAlias(NSDictionary *aliases, NSString *key) {
+    NSString *alias = [aliases[key] isKindOfClass:NSString.class] ? aliases[key] : @"";
+    return SN_TrustLogString(alias);
 }
 
-static inline NSString *SN_CurrentWiredAudioLogValue(void) {
+static NSString *SN_WiredAliasKey(NSString *portType, NSString *canonicalUID) {
+    return (portType.length && canonicalUID.length)
+        ? [NSString stringWithFormat:@"wired:%@|%@", portType, canonicalUID] : @"";
+}
+
+static NSString *SN_WiredDefaultLogName(NSString *routeName, NSString *portType, NSString *canonicalUID) {
+    NSString *name = SN_TrustLogString(routeName);
+    if ([name isEqualToString:@"-"] || canonicalUID.length == 0) return name;
+    NSString *suffix = nil;
+    if ([portType isEqualToString:AVAudioSessionPortCarAudio]) {
+        NSString *mac = [[canonicalUID componentsSeparatedByString:@"-Audio-AudioMain"] firstObject];
+        NSArray *parts = [mac componentsSeparatedByString:@":"];
+        if (parts.count >= 2) suffix = [NSString stringWithFormat:@"%@:%@", parts[parts.count - 2], parts.lastObject];
+    }
+    if (suffix.length == 0) {
+        NSMutableString *compact = [NSMutableString string];
+        NSCharacterSet *alphanumeric = NSCharacterSet.alphanumericCharacterSet;
+        for (NSUInteger i = 0; i < canonicalUID.length; i++) {
+            unichar c = [canonicalUID characterAtIndex:i];
+            if ([alphanumeric characterIsMember:c]) [compact appendFormat:@"%C", c];
+        }
+        suffix = compact.length > 4 ? [compact substringFromIndex:compact.length - 4] : compact;
+    }
+    return suffix.length ? [NSString stringWithFormat:@"%@ · %@", name, suffix] : name;
+}
+
+static NSArray<AVAudioSessionPortDescription *> *SN_CurrentBluetoothOutputs(void) {
     @try {
-        AVAudioSessionRouteDescription *route = AVAudioSession.sharedInstance.currentRoute;
-        NSMutableArray<NSString *> *entries = [NSMutableArray array];
-        for (AVAudioSessionPortDescription *output in route.outputs) {
-            if (!SNIsTrustedWiredAudioPortType(output.portType) || output.portName.length == 0) continue;
-            NSString *name = [[output.portName componentsSeparatedByCharactersInSet:NSCharacterSet.controlCharacterSet]
-                              componentsJoinedByString:@" "];
-            name = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-            NSString *type = SNTrustedWiredAudioPortTypeLabel(output.portType);
-            if (name.length > 0 && type.length > 0) {
-                [entries addObject:[NSString stringWithFormat:@"%@<%@>", name, type]];
+        NSMutableArray *outputs = [NSMutableArray array];
+        for (AVAudioSessionPortDescription *output in AVAudioSession.sharedInstance.currentRoute.outputs) {
+            NSString *type = output.portType ?: @"";
+            if ([type isEqualToString:AVAudioSessionPortBluetoothA2DP] ||
+                [type isEqualToString:AVAudioSessionPortBluetoothHFP] ||
+                [type isEqualToString:AVAudioSessionPortBluetoothLE]) {
+                [outputs addObject:output];
             }
         }
-        return entries.count > 0 ? [entries componentsJoinedByString:@","] : @"-";
+        return outputs;
     } @catch (...) {
-        return @"-";
+        return @[];
     }
 }
 
-static inline BOOL SN_IsTrustedEnvAllowed(void) {
-    if (!SN_PrefBoolFast(kSNTrustedToggleKey, NO)) return YES;
-
+static NSDictionary *SN_EvaluateTrustedConnections(BOOL trustedCheckEnabled) {
     NSUserDefaults *defs = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
-    id ssidsObj = [defs objectForKey:kSSIDsKey];
-    id btObj    = [defs objectForKey:kBTKey];
-    id wiredObj = [defs objectForKey:kWiredAudioDevicesV2Key];
-    BOOL allowAnyWired = [defs boolForKey:kAllowAnyWiredAudioDeviceKey];
-    NSArray *ssids = [ssidsObj isKindOfClass:NSArray.class] ? (NSArray *)ssidsObj : nil;
-    NSArray *bts   = [btObj isKindOfClass:NSArray.class]    ? (NSArray *)btObj    : nil;
-    NSArray *wired = [wiredObj isKindOfClass:NSArray.class] ? (NSArray *)wiredObj : nil;
+    NSArray *ssids = [[defs objectForKey:kSSIDsKey] isKindOfClass:NSArray.class] ? [defs objectForKey:kSSIDsKey] : @[];
+    NSArray *bts = [[defs objectForKey:kBTKey] isKindOfClass:NSArray.class] ? [defs objectForKey:kBTKey] : @[];
+    NSArray *wired = [[defs objectForKey:kWiredAudioDevicesV2Key] isKindOfClass:NSArray.class] ? [defs objectForKey:kWiredAudioDevicesV2Key] : @[];
+    NSDictionary *aliases = [[defs objectForKey:kTrustedConnectionAliasesV1Key] isKindOfClass:NSDictionary.class] ? [defs objectForKey:kTrustedConnectionAliasesV1Key] : @{};
+    BOOL broadWiredEnabled = [defs boolForKey:kAllowAnyWiredAudioDeviceKey];
+    NSMutableArray *sources = [NSMutableArray array];
 
-    NSString *curSSID = SN_CurrentSSID();
-    if (curSSID && SN_ListContainsString(ssids, curSSID)) return YES;
+    NSString *ssid = SN_CurrentSSID();
+    BOOL wifiMatched = ssid.length && SN_ListContainsString(ssids, ssid);
+    NSString *wifiStatus = ssid.length ? (wifiMatched ? @"matched" : @"not trusted") : nil;
+    NSString *wifiAlias = ssid.length ? SN_TrustAlias(aliases, [NSString stringWithFormat:@"wifi:%@", ssid]) : @"-";
+    NSString *wifiField = !ssid.length ? @"-" : ([wifiAlias isEqualToString:@"-"]
+        ? [NSString stringWithFormat:@"%@(%@)", SN_TrustLogString(ssid), wifiStatus]
+        : [NSString stringWithFormat:@"%@<ssid=\"%@\">(%@)", wifiAlias, SN_TrustLogString(ssid), wifiStatus]);
+    if (wifiMatched) [sources addObject:@"wifi"];
 
-    NSString *curBT = SN_CurrentBTName();
-    if (curBT && SN_ListContainsString(bts, curBT)) return YES;
+    NSMutableArray *bluetoothFields = [NSMutableArray array];
+    BOOL bluetoothMatched = NO;
+    for (AVAudioSessionPortDescription *output in SN_CurrentBluetoothOutputs()) {
+        NSString *name = SN_TrustLogString(output.portName);
+        BOOL matched = ![name isEqualToString:@"-"] && SN_ListContainsString(bts, name);
+        NSString *alias = SN_TrustAlias(aliases, [NSString stringWithFormat:@"bluetooth:%@", name]);
+        NSString *field = [alias isEqualToString:@"-"]
+            ? [NSString stringWithFormat:@"%@(%@)", name, matched ? @"matched" : @"not trusted"]
+            : [NSString stringWithFormat:@"%@<system=\"%@\">(%@)", alias, name, matched ? @"matched" : @"not trusted"];
+        [bluetoothFields addObject:field];
+        bluetoothMatched |= matched;
+    }
+    if (bluetoothMatched) [sources addObject:@"bluetooth"];
+    NSString *bluetoothField = bluetoothFields.count ? (bluetoothFields.count == 1 ? bluetoothFields.firstObject : [NSString stringWithFormat:@"[%@]", [bluetoothFields componentsJoinedByString:@","]]) : @"-";
 
-    if (SN_CurrentRouteHasTrustedWiredAudio(wired)) return YES;
-    if (allowAnyWired && SN_CurrentRouteAllowsAnyWiredAudio()) return YES;
+    NSMutableArray *wiredFields = [NSMutableArray array];
+    BOOL wiredMatched = NO;
+    BOOL hasSupportedWiredOutput = NO;
+    @try {
+        for (AVAudioSessionPortDescription *output in AVAudioSession.sharedInstance.currentRoute.outputs) {
+            if (!SNIsTrustedWiredAudioPortType(output.portType)) continue;
+            hasSupportedWiredOutput = YES;
+            NSString *name = SN_TrustLogString(output.portName);
+            NSString *typeLabel = SNTrustedWiredAudioPortTypeLabel(output.portType) ?: @"-";
+            NSString *canonicalUID = SNCanonicalWiredAudioUID(output.portType, output.UID);
+            NSDictionary *matchedEntry = nil;
+            NSDictionary *relevantEntry = nil;
+            for (NSDictionary *entry in wired) {
+                if (![entry isKindOfClass:NSDictionary.class]) continue;
+                NSString *entryType = entry[@"portType"];
+                NSString *entryUID = entry[@"uid"];
+                if (![entryType isKindOfClass:NSString.class] || ![entryUID isKindOfClass:NSString.class] ||
+                    ![SNTrustedWiredAudioPortTypeLabel(entryType) isEqualToString:typeLabel]) continue;
+                NSString *entryCanonicalUID = SNCanonicalWiredAudioUID(entryType, entryUID);
+                if ([entryCanonicalUID isEqualToString:canonicalUID]) { matchedEntry = entry; break; }
+                if (!relevantEntry && [SN_TrustLogString(entry[@"name"]) caseInsensitiveCompare:name] == NSOrderedSame) relevantEntry = entry;
+            }
+            NSDictionary *displayEntry = matchedEntry ?: relevantEntry;
+            NSString *alias = displayEntry ? SN_TrustAlias(aliases, SN_WiredAliasKey(displayEntry[@"portType"], SNCanonicalWiredAudioUID(displayEntry[@"portType"], displayEntry[@"uid"]))) : @"-";
+            NSString *displayName = ![alias isEqualToString:@"-"] ? alias : SN_WiredDefaultLogName(name, output.portType, canonicalUID);
+            NSString *status = matchedEntry ? @"matched" : (relevantEntry ? @"unmatched" : @"not trusted");
+            [wiredFields addObject:[NSString stringWithFormat:@"%@<%@/%@>(%@)", displayName, name, typeLabel, status]];
+            if (matchedEntry) wiredMatched = YES;
+        }
+    } @catch (...) {}
+    if (wiredMatched) [sources addObject:@"wired"];
+    BOOL broadWiredMatched = !wiredMatched && broadWiredEnabled && hasSupportedWiredOutput;
+    if (broadWiredMatched) [sources addObject:@"broadWired"];
+    NSString *wiredField = wiredFields.count ? [wiredFields componentsJoinedByString:@","] : @"-";
 
-    return NO;
+    BOOL allowed = !trustedCheckEnabled || sources.count > 0;
+    NSString *trustedBy = !trustedCheckEnabled ? @"trustedCheckDisabled" : (sources.count ? [sources componentsJoinedByString:@","] : @"none");
+    return @{
+        @"wifi": wifiField,
+        @"bluetooth": bluetoothField,
+        @"wired": wiredField,
+        @"broadWired": broadWiredEnabled ? @"enabled" : @"disabled",
+        @"trustedBy": trustedBy,
+        @"result": allowed ? @"allow" : @"deny",
+        @"allowed": @(allowed)
+    };
 }
 
 static inline BOOL sn_isPhoneMediaNowPlaying(void) {
@@ -1153,10 +2275,6 @@ static inline BOOL sn_isRingerMuteActive(void) {
     BOOL known = NO;
     BOOL muted = [SNMediaControl ringerMutedKnown:&known];
     return (known && muted);
-}
-
-static inline BOOL sn_isTrustedConnectionOK(void) {
-    return SN_IsTrustedEnvAllowed();
 }
 
 static inline BOOL SN_BlockOnMutePref(void);
@@ -1265,10 +2383,10 @@ static void sn_migrate_legacy_per_app_sound_suppress_overrides(void)
 }
 
 
-static void sn_try_suppress_notification_sound(id bulletin,
-                                               NSString *sectionID,
-                                               NSString *publisherID,
-                                               NSString *bulletinID)
+static NSString *sn_try_suppress_notification_sound(id bulletin,
+                                                     NSString *sectionID,
+                                                     NSString *publisherID,
+                                                     NSString *bulletinID)
 {
     NSString *globalRaw = nil;
     NSString *perAppRaw = nil;
@@ -1277,7 +2395,7 @@ static void sn_try_suppress_notification_sound(id bulletin,
     NSString *app = sn_normalized_app_counter_key(sectionID) ?: (sectionID.length ? sectionID : @"-");
     NSString *bulletinKey = bulletinID.length ? bulletinID : @"-";
 
-    if (!enabled) return;
+    if (!enabled) return @"enabled";
 
     if (DBG_SOUND_VERBOSE_ON) {
         SNLOGFMT(@"[SOUND] prefs global raw=%@ effective=%d", globalRaw ?: @"missing", (int)([globalRaw isEqualToString:@"1"]));
@@ -1286,7 +2404,7 @@ static void sn_try_suppress_notification_sound(id bulletin,
     }
 
     if (!bulletin) {
-        return;
+        return @"suppressionSkipped";
     }
 
     if (DBG_SOUND_VERBOSE_ON) {
@@ -1315,6 +2433,7 @@ static void sn_try_suppress_notification_sound(id bulletin,
     if (!succeeded && DBG_SOUND_VERBOSE_ON) {
         SNLOGFMT(@"[SOUND] suppress detail | app=%@ bulletin=%@ reason=%@", app, bulletinKey, missReason);
     }
+    return succeeded ? @"suppressed" : @"suppressionFailed";
 }
 
 static inline void sn_increment_spoken_count_for_app(NSString *bundleID)
@@ -1590,9 +2709,19 @@ static inline void SN_LoadCachedPrefs(void) {
 }
 
 
+static std::atomic_bool sFullAuditHeaderWritten{false};
+
 static inline void SN_ReloadDebugFlag(void) {
-    // Master debug is the runtime switch; category flags above remain compile-time defaults.
+    // Master debug enables all non-private audit categories in the local test build.
     gDebugLogs = SN_PrefBoolFast(kSNDebugKey, NO);
+    if (gDebugLogs) {
+        bool expected = false;
+        if (sFullAuditHeaderWritten.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            SNLOGFMT(@"[DEBUG] mode=full-audit privateText=0 categories=notif,tts,policy,volume,queue,audio,engine,sound,lang,voice,callgate,release");
+        }
+    } else {
+        sFullAuditHeaderWritten.store(false, std::memory_order_release);
+    }
 }
 
 static void SN_ApplyCancelModeFromPrefs(void);
@@ -2013,130 +3142,18 @@ static inline BOOL sn_internal_volume_set_pending(uint64_t *txnOut)
     return YES;
 }
 
-static inline void sn_log_raw_volume_event(NSString *path,
-                                           NSString *detail,
-                                           float value,
-                                           BOOL internal,
-                                           NSString *reason)
-{
-    if (!DBG_CANCEL_VERBOSE_ON) return;
-    uint64_t ensureTxn = 0;
-    BOOL ensurePending = sn_internal_volume_set_pending(&ensureTxn);
-    uint64_t now = SN_NowMS();
-    uint64_t last = gLastVolCancelAtMS.load(std::memory_order_acquire);
-    uint64_t debounceAge = (last && now >= last) ? (now - last) : 0;
-    SNCancelButtonMode mode = [SNCancellation cancelMode];
-    SNLOGFMT(@"[CANCEL] volume raw | path=%@ detail=%@ configured=%@ speaking=%d value=%.3f armed=%d cwButtons=%d internal=%d ensurePending=%d ensureTxn=%llu internalVolumeDirection=%@ lastInternalDirection=%@ lastPhysicalDirection=%@ debounceAgeMs=%llu reason=%@",
-             (path ?: @"-"),
-             (detail ?: @"-"),
-             sn_cancel_mode_name(mode),
-             (int)[SNCancellation isSpeaking],
-             value,
-             (int)sn_cancel_buttons_armed_now(),
-             (int)gLastVolumePolicyChangeWithButtons.load(std::memory_order_acquire),
-             (int)internal,
-             (int)ensurePending,
-             (unsigned long long)ensureTxn,
-             sn_volume_direction_name(gInternalVolumeDirection.load(std::memory_order_acquire)),
-             sn_volume_direction_name(gLastInternalVolumeDirection.load(std::memory_order_acquire)),
-             sn_volume_direction_name(gLastPhysicalVolumeDirection.load(std::memory_order_acquire)),
-             (unsigned long long)debounceAge,
-             (reason ?: @"raw"));
-}
-
-static inline BOOL sn_volume_restore_pending(void)
-{
-    BOOL pending = NO;
-    os_unfair_lock_lock(&gVolumeRestoreLock);
-    pending = gVolumeRestoreState.armed;
-    os_unfair_lock_unlock(&gVolumeRestoreLock);
-    return pending;
-}
-
 static BOOL sn_volume_restore_observe(float current);
 
 static void sn_handle_system_volume_change(NSString *path, float oldVolume, float newVolume)
 {
-    float oldV = sn_clampf(oldVolume, 0.0f, 1.0f);
+    (void)path;
     float newV = sn_clampf(newVolume, 0.0f, 1.0f);
-    float delta = newV - oldV;
-    SNVolumeDirection physicalDirection = sn_volume_direction(oldV, newV);
-    NSString *detail = physicalDirection == SNVolumeDirectionUp ? @"volumeUp" :
-                       (physicalDirection == SNVolumeDirectionDown ? @"volumeDown" : @"volumeUnchanged");
-    BOOL speaking = [SNCancellation isSpeaking];
     BOOL internal = sn_internal_volume_event_matches(newV, NULL);
-    int internalDirection = gInternalVolumeDirection.load(std::memory_order_acquire);
-    uint64_t activeTxn = gCurrentTxn.load(std::memory_order_acquire);
-    int lastInternalDirection =
-        (gLastInternalVolumeTxn.load(std::memory_order_acquire) == activeTxn)
-            ? gLastInternalVolumeDirection.load(std::memory_order_acquire)
-            : SNVolumeDirectionNone;
-    int relevantInternalDirection =
-        internalDirection != SNVolumeDirectionNone ? internalDirection : lastInternalDirection;
     if (!internal) {
         internal = sn_volume_restore_observe(newV);
     }
-    uint64_t ensureTxn = 0;
-    BOOL ensurePending = sn_internal_volume_set_pending(&ensureTxn);
-    BOOL restorePending = sn_volume_restore_pending();
-    SNCancelButtonMode mode = [SNCancellation cancelMode];
-    uint64_t now = SN_NowMS();
-    uint64_t previousCancel = gLastVolCancelAtMS.load(std::memory_order_acquire);
-    uint64_t debounceAge = (previousCancel && now >= previousCancel) ? (now - previousCancel) : 0;
-
-    NSString *decision = (physicalDirection != SNVolumeDirectionNone &&
-                          relevantInternalDirection == physicalDirection)
-        ? @"physicalAfterInternalDirection"
-        : @"physical-volume-change";
-    BOOL accepted = YES;
-    if (!speaking) {
-        decision = @"ignored-not-speaking";
-        accepted = NO;
-    } else if (internal) {
-        decision = @"ignored-internal-volume-set";
-        accepted = NO;
-    } else if (!sn_cancel_mode_accepts_volume(mode)) {
-        decision = @"ignored-config";
-        accepted = NO;
-    } else if (fabsf(delta) < kSNVolDeltaEps) {
-        decision = @"ignored-no-delta";
-        accepted = NO;
-    } else if (previousCancel && now > previousCancel &&
-               (now - previousCancel) < kSNImmediateDebounceMs) {
-        decision = @"ignored-debounce";
-        accepted = NO;
-    }
-
-    if (DBG_CANCEL_VERBOSE_ON) {
-        SNLOGFMT(@"[CANCEL] system volume raw | path=%@ old=%.3f new=%.3f delta=%+.3f detail=%@ speaking=%d configured=%@ armed=%d cwButtons=%d internal=%d ensurePending=%d ensureTxn=%llu internalVolumeDirection=%@ lastInternalDirection=%@ lastPhysicalDirection=%@ restorePending=%d debounceAgeMs=%llu accepted=%d reason=%@",
-                 (path ?: @"-"),
-                 oldV,
-                 newV,
-                 delta,
-                 detail,
-                 (int)speaking,
-                 sn_cancel_mode_name(mode),
-                 (int)sn_cancel_buttons_armed_now(),
-                 (int)gLastVolumePolicyChangeWithButtons.load(std::memory_order_acquire),
-                 (int)internal,
-                 (int)ensurePending,
-                 (unsigned long long)ensureTxn,
-                 sn_volume_direction_name(internalDirection),
-                 sn_volume_direction_name(lastInternalDirection),
-                 sn_volume_direction_name(gLastPhysicalVolumeDirection.load(std::memory_order_acquire)),
-                 (int)restorePending,
-                 (unsigned long long)debounceAge,
-                 (int)accepted,
-                 decision);
-    }
-
     sSN_LastVol = newV;
     sSN_VolInit = YES;
-    if (!accepted) return;
-
-    gLastPhysicalVolumeDirection.store(physicalDirection, std::memory_order_release);
-    gLastVolCancelAtMS.store(now, std::memory_order_release);
-    sn_handle_cancel_candidate("VolumeButton", detail, SNCancelCandidateVolume);
 }
 
 static NSInteger sn_tts_volume_slider_percent_from_prefs(void)
@@ -2163,7 +3180,7 @@ static float sn_expected_tts_target_for_txn(uint64_t txn)
     return sn_clampf(target, 0.0f, 1.0f);
 }
 
-static void sn_schedule_post_volume_set_check(uint64_t txn, float preVolume, float targetVolume)
+static void sn_schedule_post_volume_set_check(uint64_t txn, float preVolume, float targetVolume, BOOL restoring)
 {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
@@ -2178,6 +3195,13 @@ static void sn_schedule_post_volume_set_check(uint64_t txn, float preVolume, flo
                      (unsigned long long)txn,
                      current,
                      targetVolume);
+        }
+        if (restoring) {
+            NSString *result = fabsf(current - targetVolume) <= kSNVolumeRestoreGuardEps
+                ? @"restored" : @"restoreFailed";
+            sn_audit_volume_terminal(txn, result, current);
+        } else {
+            sn_audit_volume_set_confirmed(txn, current, targetVolume);
         }
         sn_clear_internal_volume_state(txn, "post-set-check");
     });
@@ -2219,6 +3243,7 @@ static void sn_volume_restore_capture_for_set(uint64_t txn, float previous, floa
         SNLOGFMT(@"[VOLUME] capture txn=%llu pre=%.2f target=%.2f resetAfter=1",
                  (unsigned long long)txn, previous, target);
     }
+    if (didCapture) sn_audit_volume_capture(txn, previous, target);
 }
 
 static BOOL sn_volume_restore_observe(float current)
@@ -2276,11 +3301,15 @@ static void sn_volume_restore_handoff_to_queued_txn(uint64_t txn)
 
     uint64_t fromTxn = 0;
     uint64_t originTxn = 0;
+    float previous = 0.0f;
+    float target = 0.0f;
     BOOL handedOff = NO;
     os_unfair_lock_lock(&gVolumeRestoreLock);
     if (gVolumeRestoreState.armed && gVolumeRestoreState.awaitingQueueHandoff) {
         fromTxn = gVolumeRestoreState.activeTxn;
         originTxn = gVolumeRestoreState.originTxn;
+        previous = gVolumeRestoreState.previousVolume;
+        target = gVolumeRestoreState.targetVolume;
         gVolumeRestoreState.activeTxn = txn;
         gVolumeRestoreState.awaitingQueueHandoff = NO;
         handedOff = YES;
@@ -2293,6 +3322,7 @@ static void sn_volume_restore_handoff_to_queued_txn(uint64_t txn)
                  (unsigned long long)txn,
                  (unsigned long long)originTxn);
     }
+    if (handedOff) sn_audit_volume_handoff(fromTxn, txn, originTxn, previous, target);
 }
 
 static BOOL sn_volume_restore_keeps_target_for_queued_txn(uint64_t txn)
@@ -2332,6 +3362,7 @@ static void sn_volume_restore_if_terminal(uint64_t txn, BOOL force)
     os_unfair_lock_lock(&gVolumeRestoreLock);
     if (!gVolumeRestoreState.armed) {
         os_unfair_lock_unlock(&gVolumeRestoreLock);
+        sn_audit_volume_no_capture(txn, sn_clampf([SNMediaControl currentMediaVolume], 0.0f, 1.0f));
         if (DBG_VOL_VERBOSE_ON) {
             SNLOGFMT(@"[VOLUME] restore skip txn=%llu reason=noCapture",
                      (unsigned long long)txn);
@@ -2359,6 +3390,7 @@ static void sn_volume_restore_if_terminal(uint64_t txn, BOOL force)
 
     float current = sn_clampf([SNMediaControl currentMediaVolume], 0.0f, 1.0f);
     if (userChanged || fabsf(current - target) > kSNVolumeRestoreGuardEps) {
+        sn_audit_volume_terminal(activeTxn ? activeTxn : txn, @"userChanged", current);
         if (DBG_VOL_ON) {
             SNLOGFMT(@"[VOLUME] restore skip txn=%llu reason=userChanged current=%.2f",
                      (unsigned long long)(activeTxn ? activeTxn : txn), current);
@@ -2378,26 +3410,15 @@ static void sn_volume_restore_if_terminal(uint64_t txn, BOOL force)
                                 previous,
                                 gLastVolumePolicyChangeWithButtons.load(std::memory_order_acquire));
     sn_set_system_volume(previous);
-    sn_schedule_post_volume_set_check(restoreTxn, current, previous);
+    sn_audit_volume_set_requested(restoreTxn, previous, YES);
+    sn_schedule_post_volume_set_check(restoreTxn, current, previous, YES);
 }
 
 static void SN_OnVolumeChanged(const char *keyPath, float value) {
     float v = sn_clampf(value, 0.f, 1.f);
-    sn_log_raw_volume_event(@"KVO",
-                            [NSString stringWithUTF8String:(keyPath ?: "unknown")],
-                            v,
-                            sn_internal_volume_event_matches(v, NULL),
-                            @"callback-received");
     BOOL internalSetEvent = sn_internal_volume_event_matches(v, NULL);
     BOOL snInternalRestoreEvent = sn_volume_restore_observe(v);
     if (internalSetEvent || snInternalRestoreEvent) {
-        if ([SNCancellation isSpeaking]) {
-            sn_log_raw_volume_event(@"KVO",
-                                    [NSString stringWithUTF8String:(keyPath ?: "unknown")],
-                                    v,
-                                    YES,
-                                    @"ignored-internal-volume-set");
-        }
         sSN_LastVol = v;
         sSN_VolInit = YES;
         return;
@@ -2429,77 +3450,12 @@ static void SN_OnVolumeChanged(const char *keyPath, float value) {
 
     if (SN_BlockOnMutePref() && known && muted && sn_cancel_target_active_now()) {
         if (DBG_VOL_ON) SNLOGFMT(@"[MUTE] detected during speech (pref=on) -> cancel");
-        SN_CancelAll("RingerSwitch");
+        sn_cancel_ringer_switch(@"silent");
         return;
     }
-    // --- Volume-button cancel (speak-only, single setting: Volume Button = up or down) ---
-    // Only fire while TTS or an owned A2DP pre-roll is active.
-    if (!sn_cancel_target_active_now()) {
-        sSN_LastVol = v;
-        sSN_VolInit = YES;
-        return;
-    }
-
-    // Respect prefs: only react when cancelButton == volumeupdown/any
-    SNCancelButtonMode mode = [SNCancellation cancelMode];
-    if (!sn_cancel_mode_accepts_volume(mode)) {
-        sn_log_raw_volume_event(@"KVO",
-                                [NSString stringWithUTF8String:(keyPath ?: "unknown")],
-                                v,
-                                NO,
-                                @"ignored-config");
-        sSN_LastVol = v;
-        sSN_VolInit = YES;
-        return;
-    }
-
-    sn_log_raw_volume_event(@"KVO",
-                            [NSString stringWithUTF8String:(keyPath ?: "unknown")],
-                            v,
-                            NO,
-                            @"physical-candidate");
-
-    // First real press after the arm delay: initialize baseline and cancel.
-    if (!sSN_VolInit) {
-        sSN_LastVol = v;
-        sSN_VolInit = YES;
-        uint64_t now = SN_NowMS();
-        uint64_t prev = gLastVolCancelAtMS.load(std::memory_order_relaxed);
-        if (!prev || (now > prev && (now - prev) > kSNImmediateDebounceMs)) {
-            gLastVolCancelAtMS.store(now, std::memory_order_relaxed);
-            sn_handle_cancel_candidate("VolumeButton", [NSString stringWithUTF8String:(keyPath ?: "KVO")], SNCancelCandidateVolume);
-        }
-        return;
-    }
-
-    // Subsequent presses: detect direction (either up or down is fine)
-    const float eps = kSNVolDeltaEps;
-    float oldVol = sSN_LastVol;
+    // KVO records volume state and restore ownership only; it is not physical input.
     sSN_LastVol = v;
-    BOOL moved = (v > oldVol + eps) || (v + eps < oldVol);
-    if (!moved) {
-        sn_log_raw_volume_event(@"KVO",
-                                [NSString stringWithUTF8String:(keyPath ?: "unknown")],
-                                v,
-                                NO,
-                                @"ignored-no-delta");
-        return;
-    }
-
-    // Debounce duplicate notifications
-    uint64_t now = SN_NowMS();
-    uint64_t prev = gLastVolCancelAtMS.load(std::memory_order_relaxed);
-    if (prev && now > prev && (now - prev) < kSNImmediateDebounceMs) {
-        sn_log_raw_volume_event(@"KVO",
-                                [NSString stringWithUTF8String:(keyPath ?: "unknown")],
-                                v,
-                                NO,
-                                @"ignored-debounce");
-        return;
-    }
-    gLastVolCancelAtMS.store(now, std::memory_order_relaxed);
-
-    sn_handle_cancel_candidate("VolumeButton", [NSString stringWithUTF8String:(keyPath ?: "KVO")], SNCancelCandidateVolume);
+    sSN_VolInit = YES;
 }
 
 static BOOL gSNOutVolStarted = NO;
@@ -2606,7 +3562,7 @@ static BOOL sn_try_speak_next_from_queue(const char *reason) {
         if (DBG_QUEUE_VERBOSE_ON) {
             sn_queue_log_state("drain blocked", "queue-off", 0);
         }
-        sn_queue_clear();
+        sn_queue_clear("queueDisabled");
         return NO;
     }
 
@@ -2653,7 +3609,10 @@ static BOOL sn_try_speak_next_from_queue(const char *reason) {
     NSString *b = [[item objectForKey:@"b"] retain];
     NSString *a = [[item objectForKey:@"a"] retain];
     uint64_t txn = (uint64_t)[[item objectForKey:@"x"] unsignedLongLongValue];
+    uint64_t sequence = (uint64_t)[[item objectForKey:@"n"] unsignedLongLongValue];
     [item release];
+
+    (void)sn_audit_queue_item_matches(txn, sequence);
 
     sn_volume_restore_handoff_to_queued_txn(txn);
 
@@ -2675,22 +3634,38 @@ static BOOL sn_try_speak_next_from_queue(const char *reason) {
     return YES;
 }
 
-static void sn_queue_enqueue(NSString *title, NSString *msg, NSString *bcp47, NSString *appCtx, uint64_t txn) {
+static void sn_queue_enqueue(NSString *title, NSString *msg, NSString *bcp47, NSString *appCtx,
+                             uint64_t txn, const char *reason, uint64_t behindTxn) {
     sn_queue_init_once();
     NSString *t = [ (title  ?: @"") copy ];
     NSString *m = [ (msg    ?: @"") copy ];
     NSString *b = [ (bcp47  ?: @"") copy ];
     NSString *a = [ (appCtx ?: @"") copy ];
     NSNumber *x = [[NSNumber alloc] initWithUnsignedLongLong:txn];
+    uint64_t sequence = sn_audit_sequence_for_txn(txn);
+    NSNumber *n = [[NSNumber alloc] initWithUnsignedLongLong:sequence];
     NSDictionary *item = [[NSDictionary alloc] initWithObjectsAndKeys:
-                          t, @"t", m, @"m", b, @"b", a, @"a", x, @"x", nil];
-    [t release]; [m release]; [b release]; [a release]; [x release];
+                          t, @"t", m, @"m", b, @"b", a, @"a", x, @"x", n, @"n", nil];
+    [t release]; [m release]; [b release]; [a release]; [x release]; [n release];
     
     // CRITICAL FIX: Check if queue was empty before enqueue
     dispatch_async(sSNQueueQ, ^{
         BOOL wasEmpty = (sSNQueue.count == 0);
         [sSNQueue addObject:item];
+        BOOL auditRecorded = sn_audit_record_enqueue(txn,
+                                                     sequence,
+                                                     sSNQueue.count,
+                                                     behindTxn,
+                                                     reason);
+        if (auditRecorded) sn_audit_emit_notif(txn);
         if (sSNQueue.count > kSNQueueCap) {
+            NSDictionary *evicted = [sSNQueue objectAtIndex:0];
+            uint64_t evictedTxn = (uint64_t)[evicted[@"x"] unsignedLongLongValue];
+            uint64_t evictedSequence = (uint64_t)[evicted[@"n"] unsignedLongLongValue];
+            sn_audit_record_queue_terminal(evictedTxn,
+                                           evictedSequence,
+                                           @"dropped",
+                                           @"queueCapacity");
             [sSNQueue removeObjectAtIndex:0];
         }
         if (DBG_QUEUE_ON) {
@@ -2721,9 +3696,20 @@ static void sn_queue_enqueue(NSString *title, NSString *msg, NSString *bcp47, NS
     });
 }
 
-static void sn_queue_clear(void) {
+static void sn_queue_clear(const char *reason) {
     sn_queue_init_once();
-    dispatch_async(sSNQueueQ, ^{ [sSNQueue removeAllObjects]; });
+    NSString *auditReason = [[NSString alloc] initWithUTF8String:(reason ?: "unknown")];
+    dispatch_async(sSNQueueQ, ^{
+        NSString *outcome = [auditReason isEqualToString:@"cancelAll"]
+            ? @"cancelledBeforeStart" : @"dropped";
+        for (NSDictionary *item in sSNQueue) {
+            uint64_t txn = (uint64_t)[item[@"x"] unsignedLongLongValue];
+            uint64_t sequence = (uint64_t)[item[@"n"] unsignedLongLongValue];
+            sn_audit_record_queue_terminal(txn, sequence, outcome, auditReason);
+        }
+        [sSNQueue removeAllObjects];
+        [auditReason release];
+    });
     gQueueDrainInFlight.store(false, std::memory_order_release);
 }
 
@@ -2893,18 +3879,6 @@ static inline BOOL sn_cancel_target_active_now(void)
             gStartInFlightTxn.load(std::memory_order_acquire) == txn);
 }
 
-static inline NSString *sn_cancel_mode_name(SNCancelButtonMode mode)
-{
-    switch (mode) {
-        case SNCancelButtonModePower: return @"Power";
-        case SNCancelButtonModeVolumeUp:
-        case SNCancelButtonModeVolumeDown:
-        case SNCancelButtonModeVolumeUpDown: return @"Volume";
-        case SNCancelButtonModeAny: return @"Any";
-        default: return @"None";
-    }
-}
-
 static inline BOOL sn_cancel_mode_accepts_volume(SNCancelButtonMode mode)
 {
     return (mode == SNCancelButtonModeVolumeUp ||
@@ -2916,6 +3890,9 @@ static inline BOOL sn_cancel_mode_accepts_volume(SNCancelButtonMode mode)
 static void sn_handle_cancel_candidate(const char *source, NSString *detail, SNCancelCandidateKind kind)
 {
     if (!sn_cancel_target_active_now()) return;
+
+    uint64_t txn = gCurrentTxn.load(std::memory_order_acquire);
+    if (!txn || gCancelAllTxn.load(std::memory_order_acquire) == txn) return;
 
     SNCancelButtonMode mode = [SNCancellation cancelMode];
     BOOL modeAccepted = (mode == SNCancelButtonModeAny);
@@ -2938,11 +3915,26 @@ static void sn_handle_cancel_candidate(const char *source, NSString *detail, SNC
             accepted = sn_cancel_buttons_armed_now();
         }
     }
-    if (accepted ? DBG_CANCEL_ON : DBG_CANCEL_VERBOSE_ON) {
-        SNLOGFMT(@"[CANCEL] candidate source=%s detail=%@ configured=%@ accepted=%d",
-                 (source ?: "unknown"), (detail ?: @"-"), sn_cancel_mode_name(mode), (int)accepted);
+    if (!accepted) return;
+
+    NSString *auditSource = source ? [NSString stringWithUTF8String:source] : @"-";
+    sn_audit_record_cancel_accepted(txn, auditSource, detail, @"cancel");
+
+    if (kind == SNCancelCandidateVolume && DBG_CANCEL_ON) {
+        SNLOGFMT(@"[CANCEL] accepted | txn=%llu source=VolumeButton detail=%@ action=cancel",
+                 (unsigned long long)txn,
+                 (detail ?: @"-"));
     }
-    if (accepted) SN_CancelAll(source);
+    SN_CancelAll(source);
+}
+
+static void sn_cancel_ringer_switch(NSString *detail)
+{
+    if (!sn_cancel_target_active_now()) return;
+    uint64_t txn = gCurrentTxn.load(std::memory_order_acquire);
+    if (!txn || gCancelAllTxn.load(std::memory_order_acquire) == txn) return;
+    sn_audit_record_cancel_accepted(txn, @"RingerSwitch", detail, @"cancel");
+    SN_CancelAll("RingerSwitch");
 }
 
 #pragma mark - Safe KVC / App Names
@@ -3114,7 +4106,7 @@ static void sn_handle_ringerstate_token(int token) {
     gPrevRingerSilent = nowSilent;
 
     if (SN_BlockOnMutePref() && nowSilent && sn_cancel_target_active_now()) {
-        SN_CancelAll("RingerSwitch");
+        sn_cancel_ringer_switch(@"silent");
     }
 }
 
@@ -3144,6 +4136,8 @@ static void sn_apply_tts_volume_policy(uint64_t txn)
         ? (curInt < (sliderInt - (int)tsk))
         : (fabsf(curF - target) > (tsk/100.0f));
 
+    sn_audit_volume_prepare(txn, curF, target, willSet, gPrefResetVolumeAfterSpeak);
+
     if (willSet ? DBG_VOL_ON : DBG_VOL_VERBOSE_ON) {
         NSString *route = [SNMediaControl lastOutputPortType] ?: @"-";
         BOOL locked = [SNDeviceState isDeviceLocked];
@@ -3159,9 +4153,10 @@ static void sn_apply_tts_volume_policy(uint64_t txn)
             sn_volume_restore_capture_for_set(txn, curF, target);
             sn_mark_internal_volume_set(txn, curF, target, YES);
             sn_set_system_volume(target);
+            sn_audit_volume_set_requested(txn, target, NO);
             if (DBG_VOL_ON) SNLOGFMT(@"[VOL] ensure-min SET cwButtons=1 cur=%d%% slider=%ld%% (hyst=%d)",
                                      curInt, (long)sliderInt, (int)tsk);
-            sn_schedule_post_volume_set_check(txn, curF, target);
+            sn_schedule_post_volume_set_check(txn, curF, target, NO);
         } else {
             /*if (DBG_VOL_ON) SNLOGFMT(@"[VOL] ensure-min SKIP cwButtons=1 cur=%d%% slider=%ld%% (hyst=%d)",
                                      curInt, (long)sliderInt, (int)tsk);*/
@@ -3171,9 +4166,10 @@ static void sn_apply_tts_volume_policy(uint64_t txn)
             sn_volume_restore_capture_for_set(txn, curF, target);
             sn_mark_internal_volume_set(txn, curF, target, NO);
             sn_set_system_volume(target);
+            sn_audit_volume_set_requested(txn, target, NO);
             if (DBG_VOL_ON) SNLOGFMT(@"[VOL] exact-set SET cwButtons=0 cur=%d%% slider=%ld%% (hyst=%d)",
                                      curInt, (long)sliderInt, (int)tsk);
-            sn_schedule_post_volume_set_check(txn, curF, target);
+            sn_schedule_post_volume_set_check(txn, curF, target, NO);
         } else {
             if (DBG_VOL_ON) SNLOGFMT(@"[VOL] exact-set SKIP cwButtons=0 cur=%d%% slider=%ld%% (hyst=%d)",
                                      curInt, (long)sliderInt, (int)tsk);
@@ -3367,13 +4363,19 @@ static inline void sn_post_cancel_terminal(uint64_t txn)
                                                         object:nil
                                                       userInfo:@{
                                                           kSNEngineAVUserInfoTerminalReason: @"cancel",
-                                                          kSNEngineAVUserInfoTransaction: @(txn)
+                                                          kSNEngineAVUserInfoTransaction: @(txn),
+                                                          kSNAuditSyntheticCancelTerminalKey: @YES
                                                       }];
 }
 
 void SN_CancelAll(const char *source) {
-    if (DBG_CANCEL_ON) SNLOGFMT(@"[CANCEL] source=%s speaking=%d", source, [SNCancellation isSpeaking] ? 1 : 0);
+    BOOL volumeButtonCancel = (source && strcmp(source, "VolumeButton") == 0);
+    if (DBG_CANCEL_ON && !volumeButtonCancel) {
+        SNLOGFMT(@"[CANCEL] source=%s speaking=%d", source, [SNCancellation isSpeaking] ? 1 : 0);
+    }
     uint64_t cancelTxn = gCurrentTxn.load(std::memory_order_acquire);
+    NSString *auditSource = source ? [NSString stringWithUTF8String:source] : @"-";
+    sn_audit_record_cancel_accepted(cancelTxn, auditSource, nil, @"cancel");
     BOOL wasPausedByUs = gPausedBySN;
     BOOL wasPlaying = gPreWasPlaying;
     uint64_t pauseOwnerTxn = gMediaPauseOwnerTxn.load(std::memory_order_acquire);
@@ -3391,7 +4393,7 @@ void SN_CancelAll(const char *source) {
     }
     uint64_t expectedStartTxn = cancelTxn;
     (void)gStartInFlightTxn.compare_exchange_strong(expectedStartTxn, 0, std::memory_order_acq_rel);
-    sn_queue_clear();
+    sn_queue_clear("cancelAll");
     [SNCancellation cancelAllForTransaction:cancelTxn];
 
     if (resumeEligible) {
@@ -3638,7 +4640,10 @@ static void sn_try_resume_or_schedule_poke_10s(uint64_t terminalTxn)
         if (gResumeDone.load(std::memory_order_acquire)) return;
         if (gResumeAttempted.load(std::memory_order_acquire)) return;
         if (sn_audio_chain_busy_now()) return;
-        if (sn_isPhoneMediaNowPlaying()) return;
+        if (sn_isPhoneMediaNowPlaying()) {
+            sn_audit_resume_terminal(terminalTxn, @"verified", nil, nil);
+            return;
+        }
         (void)sn_resume_core_guarded(terminalTxn);
     });
 
@@ -3647,7 +4652,10 @@ static void sn_try_resume_or_schedule_poke_10s(uint64_t terminalTxn)
         if (gResumeDone.load(std::memory_order_acquire)) return;
         if (gResumeAttempted.load(std::memory_order_acquire)) return;
         if (sn_audio_chain_busy_now()) return;
-        if (sn_isPhoneMediaNowPlaying()) return;
+        if (sn_isPhoneMediaNowPlaying()) {
+            sn_audit_resume_terminal(terminalTxn, @"verified", nil, nil);
+            return;
+        }
         (void)sn_resume_core_guarded(terminalTxn);
     });
 
@@ -3656,7 +4664,10 @@ static void sn_try_resume_or_schedule_poke_10s(uint64_t terminalTxn)
         if (gResumeDone.load(std::memory_order_acquire)) return;
         if (gResumeAttempted.load(std::memory_order_acquire)) return;
         if (sn_audio_chain_busy_now()) return;
-        if (sn_isPhoneMediaNowPlaying()) return;
+        if (sn_isPhoneMediaNowPlaying()) {
+            sn_audit_resume_terminal(terminalTxn, @"verified", nil, nil);
+            return;
+        }
 
         if (!sn_resume_owner_matches(terminalTxn, gPreNowPlayingBID)) {
             sn_log_resume_skip(terminalTxn, @"staleTxn", gPreNowPlayingBID);
@@ -3682,7 +4693,10 @@ static void sn_try_resume_or_schedule_poke_10s(uint64_t terminalTxn)
         gPokeScheduled.store(false, std::memory_order_release);
         if (gResumeDone.load(std::memory_order_acquire) || gResumeAttempted.load(std::memory_order_acquire)) return;
         if ([SNCancellation isSpeaking]) return;
-        if (sn_isPhoneMediaNowPlaying()) return;
+        if (sn_isPhoneMediaNowPlaying()) {
+            sn_audit_resume_terminal(terminalTxn, @"verified", nil, nil);
+            return;
+        }
         if (sn_queue_count() > 0) return;
 
         if (sn_can_notify_others_now()) {
@@ -3711,6 +4725,7 @@ static BOOL sn_cb_requestApply(SNDuckMode mode, NSInteger targetDb, void *ctx) {
         if (gPausedBySN) {
             uint64_t txn = gCurrentTxn.load(std::memory_order_acquire);
             gMediaPauseOwnerTxn.store(txn, std::memory_order_release);
+            sn_audit_resume_owner(txn, nil, gPreNowPlayingBID);
             if (DBG_AUDIO_VERBOSE_ON) {
                 SNLOGFMT(@"[RESUME] owner set | txn=%llu target=%@ method=pauseIfPlayingPhoneMedia pauseReturned=%d",
                          (unsigned long long)txn,
@@ -3724,6 +4739,7 @@ static BOOL sn_cb_requestApply(SNDuckMode mode, NSInteger targetDb, void *ctx) {
                      (int)pauseRequestIssued,
                      (int)pauseReturned);
         }
+        if (!gPausedBySN) sn_audit_resume_not_needed(gCurrentTxn.load(std::memory_order_acquire));
         return YES;
     }
     gPausedBySN = NO;
@@ -3785,7 +4801,8 @@ static BOOL sn_handle_start_in_flight(NSString *title, NSString *msg, NSString *
     if (!ownerTxn || ownerTxn == txn) return NO;
 
     if (SN_PrefBoolFast(@"queueNotifications", NO)) {
-        sn_queue_enqueue(title ?: @"", msg ?: @"", bcp47 ?: @"", appCtx ?: @"", txn);
+        sn_queue_enqueue(title ?: @"", msg ?: @"", bcp47 ?: @"", appCtx ?: @"",
+                         txn, "start-in-flight", ownerTxn);
         if (DBG_QUEUE_VERBOSE_ON) {
             SNLOGFMT(@"[QUEUE] enqueue | reason=start-in-flight ownerTxn=%llu txn=%llu",
                      (unsigned long long)ownerTxn,
@@ -3932,6 +4949,10 @@ static void sn_start_engine_speak_reserved(NSString *title, NSString *body, NSSt
                      sSN_LastVol);
         }
         sn_schedule_post_start_volume_check(txn, sn_expected_tts_target_for_txn(txn));
+    } else {
+        sn_audit_record_engine_rejection(txn, [SNMediaControl lastOutputPortType]);
+        sn_audit_emit_notif(txn);
+        sn_audit_try_finalize_result(txn);
     }
 }
 
@@ -4230,8 +5251,9 @@ static void sn_start_duck_chain_and_tts(NSString *title, NSString *msg, NSString
 
     BOOL continuingQueuedChain = (gQueueDrainInFlight.load(std::memory_order_acquire) &&
                                   gDuckMgr && gDuckChainAlive);
+    BOOL inheritedPlaybackChain = NO;
     if (continuingQueuedChain) {
-        sn_resume_state_handoff_to_queued_txn(txn);
+        inheritedPlaybackChain = sn_resume_state_handoff_to_queued_txn(txn);
     } else {
         sn_resume_state_clear_for_new_txn(txn);
         NSString *pbid=nil,*pname=nil,*proute=nil; BOOL pplaying=NO;
@@ -4239,11 +5261,13 @@ static void sn_start_duck_chain_and_tts(NSString *title, NSString *msg, NSString
         if (gPreNowPlayingBID) { [gPreNowPlayingBID release]; gPreNowPlayingBID = nil; }
         gPreWasPlaying = pplaying;
         gPreNowPlayingBID = (pbid.length ? [pbid copy] : nil);
+        sn_audit_playback_snapshot(txn, pname, pbid, pplaying);
     }
 
     BOOL phonePlayback = sn_isPhoneMediaNowPlaying();
     BOOL pausePref = gPrefPauseToggle ? YES : NO;
     BOOL effPause = (pausePref && phonePlayback);
+    if (!effPause && !inheritedPlaybackChain) sn_audit_resume_not_needed(txn);
     const char *modeStr = effPause ? "pause" : "none";
 
     if (effPause ? DBG_POLICY_ON : DBG_POLICY_VERBOSE_ON) {
@@ -4252,6 +5276,11 @@ static void sn_start_duck_chain_and_tts(NSString *title, NSString *msg, NSString
     }
 
     gLastDuckMode = effPause ? SNDuckModePause : SNDuckModeDuck;
+    sn_audit_update(txn, @{
+        @"policy": (effPause ? @"pause" : @"none"),
+        @"queue": (continuingQueuedChain ? @"dequeued" : @"direct"),
+        @"route": (port.length ? port : @"-")
+    });
 
     SNDuckConfig cfg;
     cfg.preRollMs      = kSNPreRollMs;
@@ -4274,7 +5303,8 @@ static void sn_start_duck_chain_and_tts(NSString *title, NSString *msg, NSString
         if ([SNCancellation isSpeaking]) {
                 BOOL qOn = SN_PrefBoolFast(@"queueNotifications", NO);
                 if (qOn) {
-                    sn_queue_enqueue(title ?: @"", msg ?: @"", useBCP47 ?: @"", appCtx ?: @"", txn);
+                    sn_queue_enqueue(title ?: @"", msg ?: @"", useBCP47 ?: @"", appCtx ?: @"",
+                                     txn, "chain-speaking", gCurrentTxn.load(std::memory_order_acquire));
                     if (DBG_POLICY_ON) SNLOGFMT(@"[POLICY] enqueue (speaking) | app=%@", SN_AppLabelForLog(appCtx, nil));
                     sn_queue_progress_nudge_after_ms(kSNQueueProgressNudgeLongMs);
                     return;
@@ -4285,6 +5315,7 @@ static void sn_start_duck_chain_and_tts(NSString *title, NSString *msg, NSString
                     return;
                 }
         }
+        if (sn_audit_record_direct(txn)) sn_audit_emit_notif(txn);
         if (gLastDuckMode == SNDuckModePause) {
             (void)[SNEngineAV activateForTTSWithDuck:NO];
         }
@@ -4356,6 +5387,7 @@ static void sn_start_duck_chain_and_tts(NSString *title, NSString *msg, NSString
     }
 
     // START NEW CHAIN
+    if (sn_audit_record_direct(txn)) sn_audit_emit_notif(txn);
     sn_clear_duck_manager_after_abort();
     sn_reserve_start_txn(txn);
     gCancelPostedTxn.store(0, std::memory_order_release);
@@ -4513,7 +5545,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.3";
+static NSString * const kReleaseInstalledVersion = @"2.1.4";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
@@ -4567,7 +5599,7 @@ static char gReleaseBBQueueSpecificKey;
 } while (0)
 
 #define RELEASE_LOG_VERBOSE(fmt, ...) do { \
-    if (gReleaseDebug.load(std::memory_order_acquire) && DEBUG_RELEASE_VERBOSE) { \
+    if (gReleaseDebug.load(std::memory_order_acquire) && (gDebugLogs || DEBUG_RELEASE_VERBOSE)) { \
         SNLOGFMT((fmt), ##__VA_ARGS__); \
     } \
 } while (0)
@@ -6512,6 +7544,16 @@ static uint64_t SN_Seq = 0;
             NSString *publisherID = SN_GetStringPropOrKVC(bulletin, @"publisherBulletinID", @"publisherBulletinID");
 
             if (body.length == 0 && subtitle.length > 0) body = subtitle;
+            uint64_t receivedMS = SN_AuditNowMS();
+            sn_audit_begin_intake(seq, @{
+                @"receivedMs": @(receivedMS),
+                @"bulletinID": (bulletinID.length ? bulletinID : @"-"),
+                @"publisherID": (publisherID.length ? publisherID : @"-"),
+                @"sectionID": (sectionID.length ? sectionID : @"-"),
+                @"titleLen": @(title.length),
+                @"subtitleLen": @(subtitle.length),
+                @"bodyLen": @(body.length)
+            });
             
             NSString *bodySan  = [SNStringUtils sanitizeForTTS:(body ?: @"")];
             NSString *normTitleOnce = [SNStringUtils normalizedTitle:(title ?: @"")];
@@ -6534,25 +7576,55 @@ static uint64_t SN_Seq = 0;
             int battPct = SN_BatteryLevelPercent();
             NSString *battState = SN_BatteryStateString(UIDevice.currentDevice.batteryState);
             BOOL lpm = SN_LowPowerModeEnabled();
+            NSDictionary *auditIngress = nil;
 
             if (allowTTS) {
-                BOOL blocked = NO;
-
                 NSUserDefaults *defs = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
                 BOOL onlyTrusted = NO;
                 id toggleObj = [defs objectForKey:kSNTrustedToggleKey];
                 if ([toggleObj isKindOfClass:NSNumber.class]) onlyTrusted = [toggleObj boolValue];
+                NSDictionary *trustedResult = SN_EvaluateTrustedConnections(onlyTrusted);
+                BOOL blocked = NO;
+                NSString *policyBlockReason = nil;
+
+                NSString *npBID = nil, *npName = nil, *npRoute = nil; BOOL npPlaying = NO;
+                SNAudioNowPlayingProbe(&npBID, &npName, &npPlaying, &npRoute);
+
+                auditIngress = @{
+                    @"seq": @(seq), @"receivedMs": @(receivedMS),
+                    @"sectionID": (sectionID.length ? sectionID : @"-"),
+                    @"titleLen": @(title.length), @"subtitleLen": @(subtitle.length), @"bodyLen": @(body.length),
+                    @"wifi": (trustedResult[@"wifi"] ?: @"-"),
+                    @"bluetooth": (trustedResult[@"bluetooth"] ?: @"-"),
+                    @"wired": (trustedResult[@"wired"] ?: @"-"),
+                    @"broadWired": (trustedResult[@"broadWired"] ?: @"disabled"),
+                    @"trust": (trustedResult[@"result"] ?: @"deny"),
+                    @"trustedBy": (trustedResult[@"trustedBy"] ?: @"none"),
+                    @"route": (npRoute.length ? npRoute : @"-"),
+                    @"otherAudio": (otherAu ? @"YES" : @"NO"), @"volume": @(volPct), @"muted": (mutedStr ?: @"-"),
+                    @"locked": (locked ? @"YES" : @"NO"),
+                    @"foreground": (fgBID.length ? [NSString stringWithFormat:@"%@(%@)", fgBID, (fgName ?: @"-")] : @"-"),
+                    @"screen": [NSString stringWithFormat:@"%d%% %@", brightPct, (orient ?: @"-")],
+                    @"battery": [NSString stringWithFormat:@"%d%%(%@) lowPower=%@", battPct, (battState ?: @"-"), (lpm ? @"YES" : @"NO")],
+                    @"queue": @"none", @"policy": @"notEvaluated",
+                    @"callGate": @"notEvaluated", @"sound": @"notAttempted",
+                    @"format": @"notEvaluated", @"lang": @"notEvaluated",
+                    @"langReason": @"notEvaluated", @"langDiagnostic": @"notEvaluated",
+                    @"voiceName": @"notEvaluated", @"action": @"notEvaluated", @"result": @"notEvaluated"
+                };
 
                 if (!blocked && onlyTrusted) {
-                    if (!sn_isTrustedConnectionOK()) {
+                    if (![trustedResult[@"allowed"] boolValue]) {
                         /*if (DBG_POLICY_ON) SNLOGFMT(@"[POLICY] blocked: untrusted connection (SSID/BT/Wired) | onlyTrusted=1");*/
                         blocked = YES;
+                        policyBlockReason = @"untrusted";
                     }
                 }
 
                 if (!blocked && SN_BlockOnMutePref() && sn_isRingerMuteActive()) {
                     /*if (DBG_POLICY_ON) SNLOGFMT(@"[POLICY] blocked: mute switch active");*/
                     blocked = YES;
+                    policyBlockReason = @"ringerMuted";
                 }
 
                 BOOL speakUnlockedOnly = gPrefSpeakUnlockedCached;
@@ -6563,6 +7635,7 @@ static uint64_t SN_Seq = 0;
 
                 if (!gPrefEnabledCached) {
                     allowTTS = NO;
+                    sn_audit_emit_denied(auditIngress, @"disabled");
                     didOrig = YES;
                     %orig(bulletin, destinations);
                     return;
@@ -6575,6 +7648,7 @@ static uint64_t SN_Seq = 0;
                     if (fg.length && [gBlockWhenOpenSet containsObject:fg]) {
                         /*if (DBG_APP_ON) SNLOGFMT(@"[APP] blocked: foreground app in global block list | fg=%@", fg);*/
                         allowTTS = NO;
+                        sn_audit_emit_denied(auditIngress, @"foregroundBlocked");
                         didOrig = YES;
                         %orig(bulletin, destinations);
                         return;
@@ -6588,6 +7662,7 @@ static uint64_t SN_Seq = 0;
                     if (fg.length && sec.length && [fg isEqualToString:sec]) {
                         /*if (DBG_APP_ON) SNLOGFMT(@"[APP] blocked: app is foreground | app=%@", sec);*/
                         allowTTS = NO;
+                        sn_audit_emit_denied(auditIngress, @"foregroundSelf");
                         didOrig = YES;
                         %orig(bulletin, destinations);
                         return;
@@ -6598,6 +7673,7 @@ static uint64_t SN_Seq = 0;
                 if (allowTTS && !sn_isAppAllowed(sectionID ?: @"")) {
                         /*if (DBG_APP_ON) SNLOGFMT(@"[APP] blocked: not whitelisted | app=%@", (sectionID ?: @"-"));*/
                         allowTTS = NO;
+                    sn_audit_emit_denied(auditIngress, @"appNotAllowed");
                     didOrig = YES;
                     %orig(bulletin, destinations);
                     return;
@@ -6605,19 +7681,25 @@ static uint64_t SN_Seq = 0;
 
                 if (blocked) {
                     allowTTS = NO;
+                    sn_audit_emit_denied(auditIngress, policyBlockReason ?: @"policyBlocked");
                     didOrig = YES;
                     %orig(bulletin, destinations);
                     return;
                 }
 
-                if (allowTTS && (sn_callgate_should_block() || !SN_ShouldSpeakNow())) {
+                BOOL callGateBlocked = sn_callgate_should_block();
+                BOOL callGateAllowed = !callGateBlocked && SN_ShouldSpeakNow();
+                if (allowTTS && !callGateAllowed) {
                     allowTTS = NO;
+                    sn_audit_emit_denied(auditIngress, callGateBlocked ? @"callActive" : @"interruption");
                     didOrig = YES;
                     %orig(bulletin, destinations);
                     return;
                 }
+                sn_audit_update_sequence(seq, @{@"callGate": @"allow"});
 
                 if (bulletinID.length > 0 && sn_seen_check_and_add_once(bulletinID)) {
+                    sn_audit_emit_denied(auditIngress, @"duplicateBulletin");
                     didOrig = YES;
                     %orig(bulletin, destinations);
                     return;
@@ -6642,6 +7724,7 @@ static uint64_t SN_Seq = 0;
                         if (alreadySpokenInWindow || identicalBodyInWindow) {
                             sn_seen_remove(bulletinID);
                             allowTTS = NO;
+                            sn_audit_emit_denied(auditIngress, @"burstDuplicate");
                             didOrig = YES;
                             %orig(bulletin, destinations);
                             return;
@@ -6654,40 +7737,13 @@ static uint64_t SN_Seq = 0;
 
             }
 
+            NSString *auditSound = @"notAttempted";
+            NSDictionary *auditPlan = nil;
+
             // All synchronous speech eligibility checks have passed.
             if (allowTTS) {
                 SN_TTS_InitOnce();
-                sn_try_suppress_notification_sound(bulletin, sectionID, publisherID, bulletinID);
-            }
-
-            NSString *npBID = nil, *npName = nil, *npRoute = nil; BOOL npPlaying = NO;
-            SNAudioNowPlayingProbe(&npBID, &npName, &npPlaying, &npRoute);
-
-            if (DBG_NOTIF_ON) {
-                NSString *logTitle = DBG_PRIVATE_TEXT_ON ? (title ?: @"") : @"<hidden>";
-                NSString *logSubtitle = DBG_PRIVATE_TEXT_ON ? (subtitle ?: @"-") : @"<hidden>";
-                NSString *logBody = DBG_PRIVATE_TEXT_ON ? (body ?: @"-") : @"<hidden>";
-                SNLOGFMT(@"[NOTIF] %02llu | title_len=%lu subtitle_len=%lu body_len=%lu | bulletin=%@ publisher=%@ | sectionName=%@ sectionID=%@ | title=\"%@\" subtitle=\"%@\" body=\"%@\" | otherAudio=%@ vol=%d%% muted=%@ locked=%@ | fgApp=%@ (%@) | nowPlayingApp=%@ (%@) playing=%@ route=%@ | screen=%d%% %@ | battery=%d%%(%@) lowPower=%@ | wifi=%@ bt=%@ wired=%@",
-                         (unsigned long long)seq,
-                         (unsigned long)title.length, (unsigned long)subtitle.length, (unsigned long)body.length,
-                         (bulletinID ?: @""), (publisherID ?: @""),
-                         SN_AppDisplayNameForSection(sectionID, bulletin),
-                         (sectionID.length ? sectionID : @"-"),
-                         logTitle, logSubtitle, logBody,
-                         (otherAu ? @"YES" : @"NO"),
-                         volPct,
-                         (mutedStr ?: @"-"),
-                         (locked ? @"YES" : @"NO"),
-                         (fgBID.length ? fgBID : @"-"), (fgName.length ? fgName : @"-"),
-                         (npBID.length ? npBID : @"-"), (npName.length ? npName : @"-"),
-                         (npPlaying ? @"YES" : @"NO"),
-                         (npRoute.length ? npRoute : @"-"),
-                         brightPct, (orient ?: @""),
-                         battPct, (battState ?: @""),
-                         (lpm ? @"YES" : @"NO"),
-                         (SN_WiFiCurrentSSID() ?: @"-"),
-                         (SN_CurrentBTName() ?: @"-"),
-                         SN_CurrentWiredAudioLogValue());
+                auditSound = sn_try_suppress_notification_sound(bulletin, sectionID, publisherID, bulletinID);
             }
 
             // Build message and choose language
@@ -6726,11 +7782,21 @@ static uint64_t SN_Seq = 0;
                 NSString *languageReason = nil;
                 NSString *languageDiagnostic = nil;
                 bcp47 = sn_detect_language_nl(languageSourceText, &detectedLanguage, &languageReason, &languageDiagnostic);
-                SNLOGFMT(@"[LANG] source=%@ %@ detected=%@ final=%@",
-                         languageSource,
-                         languageDiagnostic.length ? languageDiagnostic : @"chars=0 words=0 candidates=- system=- chosen=- reason=noCandidate",
-                         (detectedLanguage.length ? detectedLanguage : @"-"),
-                         (bcp47.length ? bcp47 : @"-"));
+                if (DBG_LANG_ON) {
+                    SNLOGFMT(@"[LANG] source=%@ %@ detected=%@ final=%@",
+                             languageSource,
+                             languageDiagnostic.length ? languageDiagnostic : @"chars=0 words=0 candidates=- system=- chosen=- reason=noCandidate",
+                             (detectedLanguage.length ? detectedLanguage : @"-"),
+                             (bcp47.length ? bcp47 : @"-"));
+                }
+                NSMutableDictionary *auditMutable = [auditIngress mutableCopy] ?: [[NSMutableDictionary alloc] init];
+                auditMutable[@"sound"] = auditSound ?: @"-";
+                auditMutable[@"format"] = fmtSrc ?: @"-";
+                auditMutable[@"lang"] = bcp47 ?: @"-";
+                auditMutable[@"langReason"] = languageReason ?: @"-";
+                auditMutable[@"langDiagnostic"] = languageDiagnostic ?: @"-";
+                auditMutable[@"callGate"] = @"allow";
+                auditPlan = [auditMutable autorelease];
 #if !__has_feature(objc_arc)
                 [detectedLanguage release];
                 [languageDiagnostic release];
@@ -6772,6 +7838,7 @@ static uint64_t SN_Seq = 0;
                         dispatch_async(dispatch_get_main_queue(), ^{
                             @autoreleasepool {
                                 uint64_t txn = sn_new_txn();
+                                sn_audit_begin(txn, seq, auditPlan ?: auditIngress);
                                 uint32_t tail = (uint32_t)kSNSiriInterTailMs;
                                 uint32_t cap  = (uint32_t)kSNSiriInterTailCapMs;
                                 BOOL carplay = SN_IsCarPlayUnlocked();
@@ -6813,7 +7880,8 @@ static uint64_t SN_Seq = 0;
                                         if ([SNCancellation isSpeaking]) {
                                             BOOL qOn = SN_PrefBoolFast(@"queueNotifications", NO);
                                             if (qOn) {
-                                                sn_queue_enqueue(capTitle, capMsg, capBCP47, capSection, txn);
+                                                sn_queue_enqueue(capTitle, capMsg, capBCP47, capSection,
+                                                                 txn, "chain-speaking", gCurrentTxn.load(std::memory_order_acquire));
                                                 if (DBG_POLICY_ON) SNLOGFMT(@"[POLICY] enqueue (chain alive & speaking) | app=%@", SN_AppLabelForLog(capSection, nil));
                                                 sn_queue_progress_nudge_after_ms(kSNQueueProgressNudgeLongMs);
                                                 [capTitle release]; [capMsg release]; [capBCP47 release]; [capSection release];
@@ -6864,7 +7932,8 @@ static uint64_t SN_Seq = 0;
                                         if (sn_speech_channel_busy_now()) {
                                             BOOL qOn = SN_PrefBoolFast(@"queueNotifications", NO);
                                             if (qOn) {
-                                                sn_queue_enqueue(capTitle, capMsg, capBCP47, capSection, txn);
+                                                sn_queue_enqueue(capTitle, capMsg, capBCP47, capSection,
+                                                                 txn, "busy-after-wait", gCurrentTxn.load(std::memory_order_acquire));
                                                 if (DBG_POLICY_ON) SNLOGFMT(@"[POLICY] enqueue (busy after wait) | app=%@", SN_AppLabelForLog(capSection, nil));
                                                 sn_queue_progress_nudge_after_ms(kSNQueueProgressNudgeLongMs);
                                                 [capTitle release]; [capMsg release]; [capBCP47 release]; [capSection release];
@@ -6907,13 +7976,6 @@ static uint64_t SN_Seq = 0;
 - (void)volumeIncreasePress:(id)press
 {
     (void)press;
-    if (DBG_CANCEL_ON) {
-        sn_log_raw_volume_event(@"SBVolumeHardwareButton.volumeIncreasePress",
-                                @"volumeUp",
-                                [SNMediaControl currentMediaVolume],
-                                NO,
-                                @"hardware-button-down");
-    }
     if ([SNCancellation isSpeaking] &&
         sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
         gLastPhysicalVolumeDirection.store(SNVolumeDirectionUp, std::memory_order_release);
@@ -6925,13 +7987,6 @@ static uint64_t SN_Seq = 0;
 - (void)volumeDecreasePress:(id)press
 {
     (void)press;
-    if (DBG_CANCEL_ON) {
-        sn_log_raw_volume_event(@"SBVolumeHardwareButton.volumeDecreasePress",
-                                @"volumeDown",
-                                [SNMediaControl currentMediaVolume],
-                                NO,
-                                @"hardware-button-down");
-    }
     if ([SNCancellation isSpeaking] &&
         sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
         gLastPhysicalVolumeDirection.store(SNVolumeDirectionDown, std::memory_order_release);
@@ -6944,20 +7999,6 @@ static uint64_t SN_Seq = 0;
 %hook SBVolumeControl
 - (void)increaseVolume
 {
-    int internalDirection = gInternalVolumeDirection.load(std::memory_order_acquire);
-    if (internalDirection == SNVolumeDirectionNone &&
-        gLastInternalVolumeTxn.load(std::memory_order_acquire) ==
-            gCurrentTxn.load(std::memory_order_acquire)) {
-        internalDirection = gLastInternalVolumeDirection.load(std::memory_order_acquire);
-    }
-    if (DBG_CANCEL_ON) {
-        sn_log_raw_volume_event(@"SBVolumeControl", @"volumeUp",
-                                [SNMediaControl currentMediaVolume],
-                                NO,
-                                internalDirection == SNVolumeDirectionUp
-                                    ? @"physicalAfterInternalDirection"
-                                    : @"hardware-hook");
-    }
     if ([SNCancellation isSpeaking] &&
         sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
         gLastPhysicalVolumeDirection.store(SNVolumeDirectionUp, std::memory_order_release);
@@ -6968,20 +8009,6 @@ static uint64_t SN_Seq = 0;
 
 - (void)decreaseVolume
 {
-    int internalDirection = gInternalVolumeDirection.load(std::memory_order_acquire);
-    if (internalDirection == SNVolumeDirectionNone &&
-        gLastInternalVolumeTxn.load(std::memory_order_acquire) ==
-            gCurrentTxn.load(std::memory_order_acquire)) {
-        internalDirection = gLastInternalVolumeDirection.load(std::memory_order_acquire);
-    }
-    if (DBG_CANCEL_ON) {
-        sn_log_raw_volume_event(@"SBVolumeControl", @"volumeDown",
-                                [SNMediaControl currentMediaVolume],
-                                NO,
-                                internalDirection == SNVolumeDirectionDown
-                                    ? @"physicalAfterInternalDirection"
-                                    : @"hardware-hook");
-    }
     if ([SNCancellation isSpeaking] &&
         sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
         gLastPhysicalVolumeDirection.store(SNVolumeDirectionDown, std::memory_order_release);
@@ -7013,12 +8040,6 @@ static uint64_t SN_Seq = 0;
     NSString *categoryName = [category isKindOfClass:NSString.class] ? (NSString *)category : @"-";
     if ([categoryName isEqualToString:@"Audio/Video"]) {
         sn_handle_system_volume_change(@"AVSystemController.setVolumeTo", oldVolume, value);
-    } else if (DBG_CANCEL_ON) {
-        sn_log_raw_volume_event(@"AVSystemController.setVolumeTo",
-                                categoryName,
-                                value,
-                                sn_internal_volume_event_matches(value, NULL),
-                                @"ignored-non-media-category");
     }
     return result;
 }
@@ -7091,19 +8112,6 @@ static inline BOOL sn_is_carplay_host_process(void)
         if (!sn_a2dp_warmup_route_is_still_valid()) {
             gA2DPWarmUntilMS.store(0, std::memory_order_release);
         }
-        if (!DBG_ROUTE_ON) return;
-        if (gLastPreflightBlocked.load(std::memory_order_acquire)) return;
-        NSDictionary *ui = n.userInfo;
-        NSNumber *r = ui[AVAudioSessionRouteChangeReasonKey];
-        if (!r) return;
-        NSInteger reason = r.integerValue;
-        if (reason == AVAudioSessionRouteChangeReasonOldDeviceUnavailable ||
-            reason == AVAudioSessionRouteChangeReasonNewDeviceAvailable ||
-            reason == AVAudioSessionRouteChangeReasonCategoryChange) {
-            AVAudioSession *s = [AVAudioSession sharedInstance];
-            NSString *port = s.currentRoute.outputs.firstObject.portType ?: @"";
-            SNLOGFMT(@"[ROUTE] change reason=%ld -> %@", (long)reason, port);
-        }
     }];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification
@@ -7121,14 +8129,20 @@ static inline BOOL sn_is_carplay_host_process(void)
     [[NSNotificationCenter defaultCenter] addObserverForName:kSNEngineAVDidSelectVoice
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *n) {
-        if (!DBG_LANG_ON) return;
+                                              usingBlock:^(NSNotification *n) {
         NSDictionary *ui = n.userInfo ?: @{};
+        uint64_t txn = [ui[kSNEngineAVUserInfoTransaction] unsignedLongLongValue];
         NSString *lang = ui[kSNEngineAVUserInfoLang] ?: @"-";
         NSString *name = ui[kSNEngineAVUserInfoVoiceName] ?: @"-";
         NSString *identifier = ui[kSNEngineAVUserInfoVoiceIdentifier] ?: @"-";
         NSString *source = ui[kSNEngineAVUserInfoVoiceSource] ?: @"-";
         NSInteger quality = [ui[kSNEngineAVUserInfoVoiceQuality] integerValue];
+        sn_audit_update(txn, @{
+            @"lang": lang, @"voiceName": name, @"voiceIdentifier": identifier,
+            @"voiceSource": source, @"voiceQuality": sn_voice_quality_label(quality)
+        });
+        sn_audit_emit_notif(txn);
+        if (!DBG_LANG_ON) return;
         BOOL unavailable = [source isEqualToString:@"unavailable"] || [identifier isEqualToString:@"-"];
         if (unavailable) {
             SNLOGFMT(@"[VOICE] unavailable | lang=%@", lang);
@@ -7136,6 +8150,30 @@ static inline BOOL sn_is_carplay_host_process(void)
             SNLOGFMT(@"[VOICE] lang=%@ name=%@ quality=%@ source=%@ identifier=%@",
                      lang, name, sn_voice_quality_label(quality), source, identifier);
         }
+    }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:kSNEngineAVDidStart
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                              usingBlock:^(NSNotification *n) {
+        uint64_t txn = sn_terminal_event_txn(n);
+        NSString *route = n.userInfo[kSNEngineAVUserInfoRouteType] ?: @"-";
+        sn_audit_record_engine_start(txn, route);
+    }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:kSNEngineAVDidGenerationDrop
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                              usingBlock:^(NSNotification *n) {
+        uint64_t txn = sn_terminal_event_txn(n);
+        NSString *reason = n.userInfo[kSNEngineAVUserInfoTerminalReason];
+        if (![reason isKindOfClass:NSString.class] || reason.length == 0) {
+            reason = @"generationInvalidated";
+        }
+        sn_audit_record_engine_terminal(txn,
+                                        @"dropped",
+                                        reason,
+                                        [SNMediaControl lastOutputPortType]);
     }];
 
     // Engine finished
@@ -7157,6 +8195,9 @@ static inline BOOL sn_is_carplay_host_process(void)
             }
             return;
         }
+
+        NSString *auditEndRoute = n.userInfo[kSNEngineAVUserInfoRouteType] ?: @"-";
+        sn_audit_record_engine_terminal(txn, @"finished", @"didFinish", auditEndRoute);
 
         if ((gPausedBySN || gPreWasPlaying) && sn_queue_count() == 0) {
             double nudgeDelay = kSNNotifyOthersNudgeSec;
@@ -7346,6 +8387,15 @@ static inline BOOL sn_is_carplay_host_process(void)
 
         uint64_t cancelAllTxn = gCancelAllTxn.load(std::memory_order_acquire);
         BOOL isCancelAllEvent = (txn != 0 && cancelAllTxn == txn);
+        BOOL syntheticCancelTerminal = [n.userInfo[kSNAuditSyntheticCancelTerminalKey] boolValue];
+        if (syntheticCancelTerminal && sn_audit_can_accept_synthetic_cancel_terminal(txn)) {
+            NSString *auditEngineReason = [terminalReason isKindOfClass:NSString.class] && terminalReason.length
+                ? terminalReason : [NSString stringWithUTF8String:reason];
+            sn_audit_record_engine_terminal(txn,
+                                            @"cancelled",
+                                            auditEngineReason,
+                                            [SNMediaControl lastOutputPortType]);
+        }
 
         if (!sn_terminal_txn_is_current(txn, reason)) {
             if (isCancelAllEvent) {
@@ -7359,6 +8409,12 @@ static inline BOOL sn_is_carplay_host_process(void)
             SNLOGFMT(@"[ENGINE] didCancel | txn=%llu utterance=notification reason=%s",
                      (unsigned long long)txn, reason);
         }
+        NSString *auditEngineReason = [terminalReason isKindOfClass:NSString.class] && terminalReason.length
+            ? terminalReason : [NSString stringWithUTF8String:reason];
+        sn_audit_record_engine_terminal(txn,
+                                        @"cancelled",
+                                        auditEngineReason,
+                                        [SNMediaControl lastOutputPortType]);
         if (!sn_finish_once_try(txn)) return;
         gClosedTxn.store(txn, std::memory_order_release);
         /* EngineAV handles teardown via keepalive on cancel */
@@ -7379,7 +8435,7 @@ static inline BOOL sn_is_carplay_host_process(void)
             (void)gCancelAllTxn.compare_exchange_strong(expectedTxn, 0, std::memory_order_acq_rel);
             [SNEngineAV teardownVoicePrompt];
             sn_volume_restore_if_terminal(txn, YES);
-            sn_queue_clear();
+            sn_queue_clear("cancelAll");
             gDuckChainAlive = NO;
             uint64_t expectedCurrent = txn;
             (void)gCurrentTxn.compare_exchange_strong(expectedCurrent, 0, std::memory_order_acq_rel);
@@ -7488,14 +8544,6 @@ static int snTokenBlank = 0;
         BOOL internalSetEvent = sn_internal_volume_event_matches(observedVol, NULL);
         BOOL snInternalRestoreEvent = (newVol >= 0.0f ? sn_volume_restore_observe(newVol) : NO);
 
-        sn_log_raw_volume_event(@"AVSystemController",
-                                ([reason isKindOfClass:NSString.class] ? reason : @"reason-missing"),
-                                observedVol,
-                                (internalSetEvent || snInternalRestoreEvent),
-                                (internalSetEvent || snInternalRestoreEvent)
-                                    ? @"ignored-internal-volume-set"
-                                    : @"notification-received");
-
         if (![SNCancellation isSpeaking]) {
             sSN_LastVol = observedVol;
             sSN_VolInit = YES;
@@ -7509,14 +8557,7 @@ static int snTokenBlank = 0;
         }
 
         if (![reason isKindOfClass:NSString.class] ||
-            ![reason isEqualToString:@"ExplicitVolumeChange"]) {
-            sn_log_raw_volume_event(@"AVSystemController",
-                                    @"volumeNotification",
-                                    observedVol,
-                                    NO,
-                                    @"ignored-system-reason");
-            return;
-        }
+            ![reason isEqualToString:@"ExplicitVolumeChange"]) return;
 
         sn_handle_system_volume_change(@"AVSystemController.SystemVolumeDidChange",
                                        oldVolume,

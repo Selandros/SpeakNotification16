@@ -4,7 +4,7 @@
 #import <pwd.h>
 #import <unistd.h>
 
-#define SN_LOG_MAX_BYTES (2 * 1024 * 1024)
+#define SN_LOG_MAX_BYTES (10 * 1024 * 1024)
 #define SN_LOG_RETENTION_DAYS 7
 
 static NSString *SN_LogDir(void) {
@@ -197,7 +197,7 @@ static void SN_SetActivePath(NSString **activePath, NSString *path) {
     *activePath = [path copy];
 }
 
-void logTextIntoFile(NSString *log, const char *file, int line) {
+static void SN_WriteLogLine(NSString *log, const char *file, int line, BOOL includeSource) {
     if (!log) return;
 
     static os_unfair_lock sLock = OS_UNFAIR_LOCK_INIT;
@@ -211,7 +211,7 @@ void logTextIntoFile(NSString *log, const char *file, int line) {
     NSDate *now = [NSDate date];
     NSString *dayKey = SN_LogDayKeyForDate(now);
     NSString *prefix = SN_LogTimeForDate(now);
-    NSString *suffix = [NSString stringWithFormat:@" | %s:%d", file ? file : "?", line];
+    NSString *suffix = includeSource ? [NSString stringWithFormat:@" | %s:%d", file ? file : "?", line] : @"";
     NSString *lineString = [NSString stringWithFormat:@"%@ %@%@\n", prefix, log, suffix];
     NSData *data = [lineString dataUsingEncoding:NSUTF8StringEncoding];
     if (!data.length) return;
@@ -330,4 +330,12 @@ void logTextIntoFile(NSString *log, const char *file, int line) {
     }
 
     os_unfair_lock_unlock(&sLock);
+}
+
+void logTextIntoFile(NSString *log, const char *file, int line) {
+    SN_WriteLogLine(log, file, line, YES);
+}
+
+void logRawTextIntoFile(NSString *log) {
+    SN_WriteLogLine(log, NULL, 0, NO);
 }

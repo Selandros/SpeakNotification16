@@ -8,6 +8,8 @@
 
 FOUNDATION_EXPORT NSString * const kSNEngineAVDidFinish;
 FOUNDATION_EXPORT NSString * const kSNEngineAVDidCancel;
+FOUNDATION_EXPORT NSString * const kSNEngineAVDidStart;
+FOUNDATION_EXPORT NSString * const kSNEngineAVDidGenerationDrop;
 FOUNDATION_EXPORT NSString * const kSNEngineAVDidSelectVoice;
 FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoTailSec;
 FOUNDATION_EXPORT NSString * const kSNEngineAVUserInfoRouteType;
