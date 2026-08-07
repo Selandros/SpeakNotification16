@@ -15,6 +15,8 @@
 
 NSString * const kSNEngineAVDidFinish = @"SNEngineAVDidFinish";
 NSString * const kSNEngineAVDidCancel = @"SNEngineAVDidCancel";
+NSString * const kSNEngineAVDidStart = @"SNEngineAVDidStart";
+NSString * const kSNEngineAVDidGenerationDrop = @"SNEngineAVDidGenerationDrop";
 NSString * const kSNEngineAVDidSelectVoice = @"SNEngineAVDidSelectVoice";
 NSString * const kSNEngineAVUserInfoTailSec = @"tailSec";
 NSString * const kSNEngineAVUserInfoRouteType = @"routeType";
@@ -219,6 +221,25 @@ static inline void SNPostTerminalWakeup(NSString *reason, uint64_t txn)
                                                           kSNEngineAVUserInfoTerminalReason: (reason ?: @"terminal"),
                                                           kSNEngineAVUserInfoTransaction: @(txn)
                                                       }];
+}
+
+/* Records a pre-start engine drop without changing terminal speech semantics. */
+static inline void SNPostGenerationDrop(uint64_t txn, NSString *reason)
+{
+    if (!txn) return;
+    [[NSNotificationCenter defaultCenter] postNotificationName:kSNEngineAVDidGenerationDrop
+                                                        object:nil
+                                                      userInfo:@{
+                                                          kSNEngineAVUserInfoTerminalReason: (reason ?: @"generationInvalidated"),
+                                                          kSNEngineAVUserInfoTransaction: @(txn)
+                                                      }];
+}
+
+static void SNPostGenerationDropsForQueue(NSArray<_SNTTSItem *> *items, NSString *reason)
+{
+    for (_SNTTSItem *item in items) {
+        SNPostGenerationDrop(item.transaction, reason);
+    }
 }
 
 static NSString *SNNormalizedVoiceLanguage(NSString *language)
@@ -669,6 +690,7 @@ static void SNRecordVoiceAttempt(NSString *language,
     SNEngineAV *me = [self shared];
     dispatch_async(me.snSerialQ, ^{
         @autoreleasepool {
+            SNPostGenerationDropsForQueue(sTTSQueue, @"generationInvalidated");
             [sTTSQueue removeAllObjects];
             [me sn_cancelTimeoutLocked];
             atomic_store(&sSpeaking, NO);
@@ -685,25 +707,28 @@ static void SNRecordVoiceAttempt(NSString *language,
         return NO;
     }
 
+    _SNTTSItem *item = [_SNTTSItem new];
+    item.text = text;
+    item.lang = lang;
+    item.gen = gen;
+    item.timeout = 25.0;
+    item.transaction = txn;
+
     __unsafe_unretained SNEngineAV *me = self;
     dispatch_async(self.snSerialQ, ^{
         @autoreleasepool {
-            if (atomic_load_explicit(&sGenAV, memory_order_relaxed) != gen) return;
+            if (atomic_load_explicit(&sGenAV, memory_order_relaxed) != item.gen) {
+                SNPostGenerationDrop(item.transaction, @"generationSuperseded");
+                return;
+            }
 
-            _SNTTSItem *it = [_SNTTSItem new];
-            it.text = text;
-            it.lang = lang;
-            it.gen = gen;
-            it.timeout = 25.0;
-            it.transaction = txn;
-
-            [sTTSQueue addObject:it];
-            [it release];
+            [sTTSQueue addObject:item];
             if (!atomic_load(&sSpeaking)) {
                 [me sn_startNextLocked];
             }
         }
     });
+    [item release];
     return YES;
 }
 
@@ -722,6 +747,7 @@ static void SNRecordVoiceAttempt(NSString *language,
     [sTTSQueue removeObjectAtIndex:0];
 
     if (atomic_load_explicit(&sGenAV, memory_order_relaxed) != it.gen) {
+        SNPostGenerationDrop(it.transaction, @"generationSuperseded");
         [it release];
         [self sn_startNextLocked];
         return;
@@ -737,6 +763,7 @@ static void SNRecordVoiceAttempt(NSString *language,
             if (atomic_load_explicit(&sGenAV, memory_order_relaxed) != it.gen) {
                 uint64_t expectedTxn = it.transaction;
                 (void)atomic_compare_exchange_strong(&sActiveTransaction, &expectedTxn, 0);
+                SNPostGenerationDrop(it.transaction, @"generationSuperseded");
                 dispatch_async(me.snSerialQ, ^{ [me sn_startNextLocked]; });
                 return;
             }
@@ -793,7 +820,8 @@ static void SNRecordVoiceAttempt(NSString *language,
                     kSNEngineAVUserInfoVoiceName: (v.name ?: @""),
                     kSNEngineAVUserInfoVoiceIdentifier: (v.identifier ?: @""),
                     kSNEngineAVUserInfoVoiceSource: voiceSource,
-                    kSNEngineAVUserInfoVoiceQuality: @(quality)
+                    kSNEngineAVUserInfoVoiceQuality: @(quality),
+                    kSNEngineAVUserInfoTransaction: @(it.transaction)
                 };
             } else {
                 voiceInfo = @{
@@ -801,7 +829,8 @@ static void SNRecordVoiceAttempt(NSString *language,
                     kSNEngineAVUserInfoVoiceName: @"-",
                     kSNEngineAVUserInfoVoiceIdentifier: @"-",
                     kSNEngineAVUserInfoVoiceSource: @"unavailable",
-                    kSNEngineAVUserInfoVoiceQuality: @0
+                    kSNEngineAVUserInfoVoiceQuality: @0,
+                    kSNEngineAVUserInfoTransaction: @(it.transaction)
                 };
             }
             u.rate = AVSpeechUtteranceDefaultSpeechRate;
@@ -814,9 +843,9 @@ static void SNRecordVoiceAttempt(NSString *language,
                 [me sn_verifyStartedLockedAfter:0.5 transaction:it.transaction generation:it.gen]; // start-watchdog
             });
 
-            [me.synth speakUtterance:u];
             SNRecordVoiceAttempt(voiceLanguage, v, voiceSource);
             [[NSNotificationCenter defaultCenter] postNotificationName:kSNEngineAVDidSelectVoice object:nil userInfo:voiceInfo];
+            [me.synth speakUtterance:u];
         }
     });
     [it release];
@@ -984,6 +1013,7 @@ static void SNRecordVoiceAttempt(NSString *language,
 
     dispatch_sync(self.snSerialQ, ^{
         @autoreleasepool {
+            SNPostGenerationDropsForQueue(sTTSQueue, @"generationInvalidated");
             [sTTSQueue removeAllObjects];
             [self sn_cancelTimeoutLocked];
             [self sn_cancelFinishKeepaliveLocked];
@@ -1064,6 +1094,20 @@ static void SNRecordVoiceAttempt(NSString *language,
 }
 
 // ================== AVSpeechSynthesizerDelegate ==================
+
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)s didStartSpeechUtterance:(AVSpeechUtterance *)u
+{
+    uint64_t txn = SNTransactionForUtterance(u);
+    if (!txn) return;
+
+    NSString *routeType = sn_current_port() ?: @"";
+    [[NSNotificationCenter defaultCenter] postNotificationName:kSNEngineAVDidStart
+                                                        object:nil
+                                                      userInfo:@{
+                                                          kSNEngineAVUserInfoRouteType: routeType,
+                                                          kSNEngineAVUserInfoTransaction: @(txn)
+                                                      }];
+}
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)s didFinishSpeechUtterance:(AVSpeechUtterance *)u
 {

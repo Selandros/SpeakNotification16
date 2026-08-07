@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 void logTextIntoFile(NSString *log, const char *file, int line);
+void logRawTextIntoFile(NSString *log);
 
 #ifdef __cplusplus
 }
