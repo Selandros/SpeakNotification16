@@ -199,7 +199,7 @@
             <key>cell</key><string>PSGroupCell</string>
             <key>label</key><string>Voice &amp; Volume</string>
             <key>footerText</key>
-            <string>Sets the target speech volume. “Change with buttons” controls whether the system volume is adjusted.</string>
+            <string>Sets the target system volume for spoken notifications.</string>
         </dict>
         <dict>
             <key>cell</key><string>PSTitleValueCell</string>
@@ -210,13 +210,6 @@
             <key>min</key><integer>0</integer>
             <key>max</key><integer>100</integer>
             <key>step</key><integer>1</integer>
-        </dict>
-        <dict>
-            <key>cell</key><string>PSSwitchCell</string>
-            <key>label</key><string>Change with buttons</string>
-            <key>defaults</key><string>com.selandros.speaknotification16</string>
-            <key>key</key><string>useSystemVolume</string>
-            <key>default</key><false/>
         </dict>
         <dict>
             <key>cell</key><string>PSSwitchCell</string>

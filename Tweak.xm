@@ -69,7 +69,6 @@ static void SNReleaseAlertsHandleBBServerLifecycle(id server);
 static NSString * const kSNDebugKey                = @"debugLoggingEnabled";
 static NSString * const kSNTrustedToggleKey        = @"onlyTrustedConnection";
 static NSString * const kSNVolSliderKey            = @"speechVolume";
-static NSString * const kSNChangeWithButtonsKey    = @"useSystemVolume";
 static NSString * const kSNResetVolumeAfterSpeakKey = @"SNResetVolumeAfterSpeakEnabled";
 static NSString * const kSNPerAppDisableSoundKey    = @"perAppDisableNotificationSound";
 static NSString * const kSNSoundSuppressMigrationKey = @"soundSuppressPerAppMigrationDone";
@@ -170,8 +169,8 @@ static const NSUInteger kSNPreRollMs                 = 200;    // Pre-roll befor
 static const NSUInteger kSNPostRollMs                = 0;      // Post-roll after TTS ends 500
 static const NSUInteger kSNFailSafeConfirmMs         = 300;    // Failsafe confirmation timeout
 static const uint32_t   kSNPauseSettleMs             = 60;     // Pause->TTS settle
-static const NSUInteger kSNA2DPAudioPreRollMs        = 400;    // Zero-PCM warm-up before cold A2DP TTS
-static const NSUInteger kSNA2DPWarmWindowMs          = 1200;   // Skip repeated warm-ups while the headset route remains warm
+static const NSUInteger kSNA2DPAudioPreRollMs        = kSNA2DPDefaultWarmupMs;    // Zero-PCM warm-up before cold A2DP TTS
+static const NSUInteger kSNA2DPWarmWindowMs          = kSNA2DPDefaultKeepWarmMs; // Skip repeated warm-ups while the headset route remains warm
 static const NSInteger  tsk                          = 1;      // Volume hysteresis steps (% points)
 static const double     kSNFallbackPokeDelaySec      = 10.0;   // Last-resort "notify others" after no resume
 
@@ -299,6 +298,9 @@ static std::atomic_uint64_t gA2DPSessionWarmupAttemptedTxn{0};
 static std::atomic_uint64_t gA2DPSessionWarmupPendingTxn{0};
 static std::atomic_uint64_t gA2DPWarmUntilMS{0};
 static std::atomic_uint64_t gA2DPWarmupAbortedTxn{0};
+static os_unfair_lock gA2DPWarmStateLock = OS_UNFAIR_LOCK_INIT;
+static NSString *gA2DPWarmDeviceUID = nil;
+static NSMutableDictionary<NSNumber *, NSDictionary *> *gA2DPTuningSnapshots = nil;
 
 static os_unfair_lock gSNFormatLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock gLastSpeakLock = OS_UNFAIR_LOCK_INIT;
@@ -352,8 +354,6 @@ static std::atomic_int gInternalVolumeTargetMilli{-1};
 static std::atomic_int gInternalVolumeDirection{0};
 static std::atomic_uint64_t gLastInternalVolumeTxn{0};
 static std::atomic_int gLastInternalVolumeDirection{0};
-static std::atomic_int gLastPhysicalVolumeDirection{0};
-static std::atomic_bool gLastVolumePolicyChangeWithButtons{false};
 static std::atomic_uint64_t gVolumeReleaseWaitTxn{0};
 static BOOL gRingerInit = NO;
 static BOOL gPrevRingerSilent = NO;
@@ -1006,42 +1006,23 @@ static void sn_audit_record_engine_rejection(uint64_t txn, NSString *route)
 }
 
 /* Volume audit records observed ownership without changing volume policy. */
-static void sn_audit_volume_prepare(uint64_t txn, float pre, float target, BOOL willSet, BOOL ownsRestore)
+static void sn_audit_volume_prepare(uint64_t txn, float pre, float target, BOOL ownsRestore)
 {
     if (!txn) return;
-    BOOL terminalRecorded = NO;
     os_unfair_lock_lock(&gSNAuditLock);
     NSString *intakeKey = gSNAuditTxnToIntakeKeys[sn_audit_key(txn)];
     NSMutableDictionary *record = gSNAuditIntakeRecords[intakeKey];
     if (record && !record[@"volumeResult"]) {
-        record[@"volumeOwned"] = @(ownsRestore && willSet);
-        record[@"volumeOriginTxn"] = ownsRestore && willSet ? @(txn) : @0;
-        record[@"volumeOwnerTxn"] = ownsRestore && willSet ? @(txn) : @0;
+        record[@"volumeOwned"] = @(ownsRestore);
+        record[@"volumeOriginTxn"] = ownsRestore ? @(txn) : @0;
+        record[@"volumeOwnerTxn"] = ownsRestore ? @(txn) : @0;
         record[@"volumePre"] = @(pre);
-        if (willSet) {
-            record[@"volumeTarget"] = @(target);
-        } else {
-            [record removeObjectForKey:@"volumeTarget"];
-        }
+        record[@"volumeTarget"] = @(target);
         record[@"volumeChangedByUs"] = @NO;
-        if (!willSet) {
-            record[@"volumeFinal"] = @(pre);
-            record[@"volumeResult"] = @"unchanged";
-            record[@"volumeTerminal"] = @YES;
-            record[@"volumeTerminalMs"] = @(SN_AuditNowMS());
-            terminalRecorded = YES;
-        } else if (!ownsRestore) {
-            record[@"volumeResult"] = @"notOwned";
-            record[@"volumeTerminal"] = @YES;
-            record[@"volumeTerminalMs"] = @(SN_AuditNowMS());
-            terminalRecorded = YES;
-        } else {
-            record[@"volumeResult"] = @"pending";
-            record[@"volumeTerminal"] = @NO;
-        }
+        record[@"volumeResult"] = @"pending";
+        record[@"volumeTerminal"] = @NO;
     }
     os_unfair_lock_unlock(&gSNAuditLock);
-    if (terminalRecorded) sn_audit_try_finalize_result(txn);
 }
 
 static void sn_audit_volume_capture(uint64_t txn, float pre, float target)
@@ -1129,7 +1110,8 @@ static void sn_audit_volume_handoff(uint64_t fromTxn,
                                     uint64_t toTxn,
                                     uint64_t originTxn,
                                     float pre,
-                                    float target)
+                                    float target,
+                                    BOOL ownsRestore)
 {
     if (!fromTxn || !toTxn || !originTxn) return;
     BOOL fromTerminal = NO;
@@ -1141,8 +1123,8 @@ static void sn_audit_volume_handoff(uint64_t fromTxn,
     NSNumber *setMs = from[@"volumeSetMs"];
     NSNumber *changedByUs = from[@"volumeChangedByUs"] ?: @NO;
     if (from && ![from[@"volumeTerminal"] boolValue]) {
-        from[@"volumeOwned"] = @YES;
-        from[@"volumeOriginTxn"] = @(originTxn);
+        from[@"volumeOwned"] = @(ownsRestore);
+        from[@"volumeOriginTxn"] = ownsRestore ? @(originTxn) : @0;
         from[@"volumeOwnerTxn"] = @(toTxn);
         from[@"volumeHandoffTxn"] = @(toTxn);
         from[@"volumeResult"] = @"handedOff";
@@ -1151,8 +1133,8 @@ static void sn_audit_volume_handoff(uint64_t fromTxn,
         fromTerminal = YES;
     }
     if (to) {
-        to[@"volumeOwned"] = @YES;
-        to[@"volumeOriginTxn"] = @(originTxn);
+        to[@"volumeOwned"] = @(ownsRestore);
+        to[@"volumeOriginTxn"] = ownsRestore ? @(originTxn) : @0;
         to[@"volumeOwnerTxn"] = @(toTxn);
         to[@"volumeInherited"] = @YES;
         to[@"volumePre"] = @(pre);
@@ -3021,12 +3003,19 @@ static void sn_set_system_volume(float v) {
 typedef struct {
     uint64_t activeTxn;
     uint64_t originTxn;
-    float previousVolume;
-    float targetVolume;
+    float restoreBaseline;
+    float speechVolumeTarget;
+    float physicalCancelVolumeBaseline;
     BOOL armed;
+    BOOL resetAfterSpeaking;
+    BOOL hasRestoreBaseline;
+    BOOL hasPhysicalCancelVolumeBaseline;
     BOOL awaitingInternalSet;
     BOOL awaitingQueueHandoff;
-    BOOL userChanged;
+    BOOL physicalSpeechVolumeMemoryPending;
+    uint64_t physicalSpeechVolumeMemoryTxn;
+    uint64_t physicalSpeechVolumeMemoryGeneration;
+    NSString *outputRouteIdentity;
 } SNVolumeRestoreState;
 
 static os_unfair_lock gVolumeRestoreLock = OS_UNFAIR_LOCK_INIT;
@@ -3052,6 +3041,34 @@ static inline SNVolumeDirection sn_volume_direction(float from, float to)
     if (to > from + kSNVolDeltaEps) return SNVolumeDirectionUp;
     if (to < from - kSNVolDeltaEps) return SNVolumeDirectionDown;
     return SNVolumeDirectionNone;
+}
+
+static NSString *sn_current_a2dp_route_uid(void)
+{
+    @try {
+        AVAudioSessionPortDescription *output = [AVAudioSession sharedInstance].currentRoute.outputs.firstObject;
+        if (![output.portType isEqualToString:AVAudioSessionPortBluetoothA2DP]) return nil;
+        NSString *uid = SNCanonicalBluetoothDeviceUID(output.UID);
+        return uid.length ? uid : nil;
+    } @catch (...) {
+        return nil;
+    }
+}
+
+static NSString *sn_current_volume_route_identity(void)
+{
+    @try {
+        AVAudioSessionPortDescription *output = [AVAudioSession sharedInstance].currentRoute.outputs.firstObject;
+        NSString *portType = output.portType;
+        NSString *uid = output.UID;
+        if (portType.length == 0 || uid.length == 0) return nil;
+        if ([portType isEqualToString:AVAudioSessionPortBluetoothA2DP]) {
+            uid = SNCanonicalBluetoothDeviceUID(uid);
+        }
+        return uid.length ? [NSString stringWithFormat:@"%@|%@", portType, uid] : nil;
+    } @catch (...) {
+        return nil;
+    }
 }
 
 static void sn_clear_internal_volume_state(uint64_t expectedTxn, const char *reason)
@@ -3088,8 +3105,7 @@ static inline void sn_clear_stale_internal_volume_state_for_txn(uint64_t txn)
 
 static inline void sn_mark_internal_volume_set(uint64_t txn,
                                                float previous,
-                                               float target,
-                                               BOOL changeWithButtons)
+                                               float target)
 {
     SNVolumeDirection direction = sn_volume_direction(previous, target);
     gInternalVolumeSetTxn.store(txn, std::memory_order_release);
@@ -3100,8 +3116,6 @@ static inline void sn_mark_internal_volume_set(uint64_t txn,
     gLastInternalVolumeDirection.store(direction, std::memory_order_release);
     gInternalVolumeSetUntilMS.store(SN_NowMS() + kSNInternalVolumeSetWindowMs,
                                     std::memory_order_release);
-    gLastVolumePolicyChangeWithButtons.store(changeWithButtons ? true : false,
-                                             std::memory_order_release);
 }
 
 static inline BOOL sn_internal_volume_event_matches(float current, uint64_t *txnOut)
@@ -3174,7 +3188,7 @@ static float sn_expected_tts_target_for_txn(uint64_t txn)
     float target = ((float)sn_tts_volume_slider_percent_from_prefs()) / 100.0f;
     os_unfair_lock_lock(&gVolumeRestoreLock);
     if (txn && gVolumeRestoreState.armed && gVolumeRestoreState.activeTxn == txn) {
-        target = gVolumeRestoreState.targetVolume;
+        target = gVolumeRestoreState.speechVolumeTarget;
     }
     os_unfair_lock_unlock(&gVolumeRestoreLock);
     return sn_clampf(target, 0.0f, 1.0f);
@@ -3219,31 +3233,42 @@ static void sn_schedule_post_start_volume_check(uint64_t txn, float expectedMin)
     });
 }
 
-static void sn_volume_restore_capture_for_set(uint64_t txn, float previous, float target)
+static void sn_volume_policy_begin(uint64_t txn,
+                                   float currentVolume,
+                                   float speechVolumeTarget,
+                                   BOOL resetAfterSpeaking)
 {
-    if (!gPrefResetVolumeAfterSpeak || !txn) return;
+    if (!txn) return;
 
     BOOL didCapture = NO;
+    NSString *routeIdentity = [sn_current_volume_route_identity() copy];
     os_unfair_lock_lock(&gVolumeRestoreLock);
     if (!gVolumeRestoreState.armed || gVolumeRestoreState.activeTxn != txn) {
+        [gVolumeRestoreState.outputRouteIdentity release];
         gVolumeRestoreState = {};
         gVolumeRestoreState.activeTxn = txn;
         gVolumeRestoreState.originTxn = txn;
-        gVolumeRestoreState.previousVolume = previous;
-        gVolumeRestoreState.userChanged = NO;
+        gVolumeRestoreState.resetAfterSpeaking = resetAfterSpeaking;
+        gVolumeRestoreState.hasRestoreBaseline = resetAfterSpeaking;
+        gVolumeRestoreState.restoreBaseline = currentVolume;
+        gVolumeRestoreState.outputRouteIdentity = routeIdentity;
+        routeIdentity = nil;
         gVolumeRestoreState.armed = YES;
         didCapture = YES;
     }
-    gVolumeRestoreState.targetVolume = target;
-    gVolumeRestoreState.awaitingInternalSet = YES;
+    gVolumeRestoreState.speechVolumeTarget = speechVolumeTarget;
+    gVolumeRestoreState.awaitingInternalSet = NO;
     gVolumeRestoreState.awaitingQueueHandoff = NO;
     os_unfair_lock_unlock(&gVolumeRestoreLock);
+    [routeIdentity release];
 
-    if (didCapture && DBG_VOL_ON) {
+    if (didCapture && resetAfterSpeaking && DBG_VOL_ON) {
         SNLOGFMT(@"[VOLUME] capture txn=%llu pre=%.2f target=%.2f resetAfter=1",
-                 (unsigned long long)txn, previous, target);
+                 (unsigned long long)txn, currentVolume, speechVolumeTarget);
     }
-    if (didCapture) sn_audit_volume_capture(txn, previous, target);
+    if (didCapture && resetAfterSpeaking) {
+        sn_audit_volume_capture(txn, currentVolume, speechVolumeTarget);
+    }
 }
 
 static BOOL sn_volume_restore_observe(float current)
@@ -3256,7 +3281,7 @@ static BOOL sn_volume_restore_observe(float current)
     }
 
     if (gVolumeRestoreState.awaitingInternalSet) {
-        if (fabsf(current - gVolumeRestoreState.targetVolume) <= kSNVolumeRestoreGuardEps) {
+        if (fabsf(current - gVolumeRestoreState.speechVolumeTarget) <= kSNVolumeRestoreGuardEps) {
             gVolumeRestoreState.awaitingInternalSet = NO;
             internalEvent = YES;
             os_unfair_lock_unlock(&gVolumeRestoreLock);
@@ -3265,11 +3290,101 @@ static BOOL sn_volume_restore_observe(float current)
         gVolumeRestoreState.awaitingInternalSet = NO;
     }
 
-    if (fabsf(current - gVolumeRestoreState.targetVolume) > kSNVolumeRestoreGuardEps) {
-        gVolumeRestoreState.userChanged = YES;
-    }
     os_unfair_lock_unlock(&gVolumeRestoreLock);
     return internalEvent;
+}
+
+static void sn_volume_restore_note_physical_cancel_baseline(void)
+{
+    if (!sn_cancel_target_active_now()) return;
+    if (!sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) return;
+    uint64_t txn = gCurrentTxn.load(std::memory_order_acquire);
+    if (!txn) return;
+    float current = sn_clampf([SNMediaControl currentMediaVolume], 0.0f, 1.0f);
+    os_unfair_lock_lock(&gVolumeRestoreLock);
+    if (gVolumeRestoreState.armed &&
+        gVolumeRestoreState.activeTxn == txn &&
+        !gVolumeRestoreState.resetAfterSpeaking &&
+        !gVolumeRestoreState.hasPhysicalCancelVolumeBaseline) {
+        gVolumeRestoreState.physicalCancelVolumeBaseline = current;
+        gVolumeRestoreState.hasPhysicalCancelVolumeBaseline = YES;
+    }
+    os_unfair_lock_unlock(&gVolumeRestoreLock);
+}
+
+static BOOL sn_volume_memory_begin_physical_button(void)
+{
+    if (![SNCancellation isSpeaking]) return NO;
+    if (sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) return NO;
+
+    uint64_t txn = gCurrentTxn.load(std::memory_order_acquire);
+    if (!txn || gCancelAllTxn.load(std::memory_order_acquire) == txn) return NO;
+
+    BOOL began = NO;
+    os_unfair_lock_lock(&gVolumeRestoreLock);
+    if (gVolumeRestoreState.armed &&
+        gVolumeRestoreState.activeTxn == txn &&
+        !gVolumeRestoreState.resetAfterSpeaking &&
+        !gVolumeRestoreState.physicalSpeechVolumeMemoryPending) {
+        gVolumeRestoreState.physicalSpeechVolumeMemoryPending = YES;
+        gVolumeRestoreState.physicalSpeechVolumeMemoryTxn = txn;
+        gVolumeRestoreState.physicalSpeechVolumeMemoryGeneration++;
+        began = YES;
+    }
+    os_unfair_lock_unlock(&gVolumeRestoreLock);
+    return began;
+}
+
+static void sn_volume_memory_commit_physical_button(void)
+{
+    uint64_t txn = 0;
+    uint64_t generation = 0;
+    os_unfair_lock_lock(&gVolumeRestoreLock);
+    if (gVolumeRestoreState.armed &&
+        gVolumeRestoreState.physicalSpeechVolumeMemoryPending) {
+        txn = gVolumeRestoreState.physicalSpeechVolumeMemoryTxn;
+        generation = gVolumeRestoreState.physicalSpeechVolumeMemoryGeneration;
+    }
+    os_unfair_lock_unlock(&gVolumeRestoreLock);
+    if (!txn || !generation) return;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        BOOL shouldPersist = NO;
+        os_unfair_lock_lock(&gVolumeRestoreLock);
+        if (gVolumeRestoreState.armed &&
+            gVolumeRestoreState.activeTxn == txn &&
+            !gVolumeRestoreState.resetAfterSpeaking &&
+            gVolumeRestoreState.physicalSpeechVolumeMemoryPending &&
+            gVolumeRestoreState.physicalSpeechVolumeMemoryTxn == txn &&
+            gVolumeRestoreState.physicalSpeechVolumeMemoryGeneration == generation &&
+            gCurrentTxn.load(std::memory_order_acquire) == txn &&
+            gCancelAllTxn.load(std::memory_order_acquire) != txn &&
+            [SNCancellation isSpeaking] &&
+            !sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
+            shouldPersist = YES;
+        }
+        if (gVolumeRestoreState.physicalSpeechVolumeMemoryPending &&
+            gVolumeRestoreState.physicalSpeechVolumeMemoryTxn == txn &&
+            gVolumeRestoreState.physicalSpeechVolumeMemoryGeneration == generation) {
+            gVolumeRestoreState.physicalSpeechVolumeMemoryPending = NO;
+            gVolumeRestoreState.physicalSpeechVolumeMemoryTxn = 0;
+        }
+        os_unfair_lock_unlock(&gVolumeRestoreLock);
+        if (!shouldPersist) return;
+
+        NSInteger percent = (NSInteger)lroundf(sn_clampf([SNMediaControl currentMediaVolume], 0.0f, 1.0f) * 100.0f);
+        NSUserDefaults *defaults = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
+        id existing = [defaults objectForKey:kSNVolSliderKey];
+        if ([existing respondsToSelector:@selector(integerValue)] && [existing integerValue] == percent) return;
+        [defaults setInteger:percent forKey:kSNVolSliderKey];
+        [defaults synchronize];
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             kSNPrefsNotify,
+                                             NULL,
+                                             NULL,
+                                             true);
+    });
 }
 
 static BOOL sn_volume_restore_defer_for_queue(uint64_t txn, NSUInteger pending)
@@ -3279,7 +3394,9 @@ static BOOL sn_volume_restore_defer_for_queue(uint64_t txn, NSUInteger pending)
     uint64_t originTxn = 0;
     BOOL deferred = NO;
     os_unfair_lock_lock(&gVolumeRestoreLock);
-    if (gVolumeRestoreState.armed && gVolumeRestoreState.activeTxn == txn) {
+    if (gVolumeRestoreState.armed &&
+        gVolumeRestoreState.activeTxn == txn &&
+        gVolumeRestoreState.resetAfterSpeaking) {
         gVolumeRestoreState.awaitingQueueHandoff = YES;
         originTxn = gVolumeRestoreState.originTxn;
         deferred = YES;
@@ -3303,13 +3420,15 @@ static void sn_volume_restore_handoff_to_queued_txn(uint64_t txn)
     uint64_t originTxn = 0;
     float previous = 0.0f;
     float target = 0.0f;
+    BOOL ownsRestore = NO;
     BOOL handedOff = NO;
     os_unfair_lock_lock(&gVolumeRestoreLock);
     if (gVolumeRestoreState.armed && gVolumeRestoreState.awaitingQueueHandoff) {
         fromTxn = gVolumeRestoreState.activeTxn;
         originTxn = gVolumeRestoreState.originTxn;
-        previous = gVolumeRestoreState.previousVolume;
-        target = gVolumeRestoreState.targetVolume;
+        previous = gVolumeRestoreState.restoreBaseline;
+        target = gVolumeRestoreState.speechVolumeTarget;
+        ownsRestore = gVolumeRestoreState.resetAfterSpeaking;
         gVolumeRestoreState.activeTxn = txn;
         gVolumeRestoreState.awaitingQueueHandoff = NO;
         handedOff = YES;
@@ -3322,7 +3441,7 @@ static void sn_volume_restore_handoff_to_queued_txn(uint64_t txn)
                  (unsigned long long)txn,
                  (unsigned long long)originTxn);
     }
-    if (handedOff) sn_audit_volume_handoff(fromTxn, txn, originTxn, previous, target);
+    if (handedOff) sn_audit_volume_handoff(fromTxn, txn, originTxn, previous, target, ownsRestore);
 }
 
 static BOOL sn_volume_restore_keeps_target_for_queued_txn(uint64_t txn)
@@ -3334,6 +3453,7 @@ static BOOL sn_volume_restore_keeps_target_for_queued_txn(uint64_t txn)
     os_unfair_lock_lock(&gVolumeRestoreLock);
     if (gVolumeRestoreState.armed &&
         gVolumeRestoreState.activeTxn == txn &&
+        gVolumeRestoreState.resetAfterSpeaking &&
         gVolumeRestoreState.originTxn != 0 &&
         gVolumeRestoreState.originTxn != txn) {
         originTxn = gVolumeRestoreState.originTxn;
@@ -3354,10 +3474,13 @@ static void sn_volume_restore_if_terminal(uint64_t txn, BOOL force)
     if (!force && [SNCancellation isSpeaking]) return;
 
     float previous = 0.0f;
-    float target = 0.0f;
     uint64_t activeTxn = 0;
     uint64_t originTxn = 0;
-    BOOL userChanged = NO;
+    BOOL resetAfterSpeaking = NO;
+    BOOL hasRestoreBaseline = NO;
+    BOOL hasPhysicalCancelVolumeBaseline = NO;
+    float physicalCancelVolumeBaseline = 0.0f;
+    NSString *routeIdentity = nil;
 
     os_unfair_lock_lock(&gVolumeRestoreLock);
     if (!gVolumeRestoreState.armed) {
@@ -3382,19 +3505,34 @@ static void sn_volume_restore_if_terminal(uint64_t txn, BOOL force)
 
     activeTxn = gVolumeRestoreState.activeTxn;
     originTxn = gVolumeRestoreState.originTxn;
-    previous = gVolumeRestoreState.previousVolume;
-    target = gVolumeRestoreState.targetVolume;
-    userChanged = gVolumeRestoreState.userChanged;
+    previous = gVolumeRestoreState.restoreBaseline;
+    resetAfterSpeaking = gVolumeRestoreState.resetAfterSpeaking;
+    hasRestoreBaseline = gVolumeRestoreState.hasRestoreBaseline;
+    hasPhysicalCancelVolumeBaseline = gVolumeRestoreState.hasPhysicalCancelVolumeBaseline;
+    physicalCancelVolumeBaseline = gVolumeRestoreState.physicalCancelVolumeBaseline;
+    routeIdentity = [gVolumeRestoreState.outputRouteIdentity retain];
+    [gVolumeRestoreState.outputRouteIdentity release];
     gVolumeRestoreState = {};
     os_unfair_lock_unlock(&gVolumeRestoreLock);
 
     float current = sn_clampf([SNMediaControl currentMediaVolume], 0.0f, 1.0f);
-    if (userChanged || fabsf(current - target) > kSNVolumeRestoreGuardEps) {
-        sn_audit_volume_terminal(activeTxn ? activeTxn : txn, @"userChanged", current);
-        if (DBG_VOL_ON) {
-            SNLOGFMT(@"[VOLUME] restore skip txn=%llu reason=userChanged current=%.2f",
-                     (unsigned long long)(activeTxn ? activeTxn : txn), current);
-        }
+    uint64_t restoreTxn = activeTxn ? activeTxn : txn;
+    BOOL sameRoute = (routeIdentity.length &&
+                      [routeIdentity isEqualToString:sn_current_volume_route_identity()]);
+    BOOL shouldRestore = hasRestoreBaseline && resetAfterSpeaking;
+    float restoreTarget = previous;
+    if (!shouldRestore && hasPhysicalCancelVolumeBaseline) {
+        shouldRestore = YES;
+        restoreTarget = physicalCancelVolumeBaseline;
+    }
+    if (!shouldRestore || !sameRoute) {
+        sn_audit_volume_terminal(restoreTxn, @"notOwned", current);
+        [routeIdentity release];
+        return;
+    }
+    if (fabsf(current - restoreTarget) <= kSNVolumeRestoreGuardEps) {
+        sn_audit_volume_terminal(restoreTxn, @"restored", current);
+        [routeIdentity release];
         return;
     }
 
@@ -3404,14 +3542,13 @@ static void sn_volume_restore_if_terminal(uint64_t txn, BOOL force)
                  (unsigned long long)originTxn,
                  previous, current);
     }
-    uint64_t restoreTxn = activeTxn ? activeTxn : txn;
     sn_mark_internal_volume_set(restoreTxn,
                                 current,
-                                previous,
-                                gLastVolumePolicyChangeWithButtons.load(std::memory_order_acquire));
-    sn_set_system_volume(previous);
-    sn_audit_volume_set_requested(restoreTxn, previous, YES);
-    sn_schedule_post_volume_set_check(restoreTxn, current, previous, YES);
+                                restoreTarget);
+    sn_set_system_volume(restoreTarget);
+    sn_audit_volume_set_requested(restoreTxn, restoreTarget, YES);
+    sn_schedule_post_volume_set_check(restoreTxn, current, restoreTarget, YES);
+    [routeIdentity release];
 }
 
 static void SN_OnVolumeChanged(const char *keyPath, float value) {
@@ -3760,9 +3897,7 @@ static BOOL sn_queue_finish_terminal(const char *reason, uint64_t txn)
 
     NSUInteger pending = sn_queue_count();
     BOOL queueCanContinue = (pending > 0 && SN_PrefBoolFast(@"queueNotifications", NO));
-    if (queueCanContinue) {
-        (void)sn_volume_restore_defer_for_queue(txn, pending);
-    }
+    BOOL deferredVolumeRestore = queueCanContinue && sn_volume_restore_defer_for_queue(txn, pending);
 
     if (DBG_QUEUE_VERBOSE_ON) {
         const char *event = "finish terminal";
@@ -3776,6 +3911,9 @@ static BOOL sn_queue_finish_terminal(const char *reason, uint64_t txn)
 
     BOOL startedNext = NO;
     if (queueCanContinue) {
+        if (!deferredVolumeRestore) {
+            sn_volume_restore_if_terminal(txn, YES);
+        }
         sn_hold_audio_for_queue_handoff(txn);
         if (DBG_QUEUE_VERBOSE_ON) {
             SNLOGFMT(@"[QUEUE] audio hold | txn=%llu pending=%lu",
@@ -3837,7 +3975,6 @@ static inline void sn_arm_speak_guard(NSUInteger totalChars) {
     gSpeakStartAtMS = SN_NowMS();
     gSpeakFinishArmed = YES;
     gLastVolCancelAtMS.store(0, std::memory_order_release);
-    gLastPhysicalVolumeDirection.store(SNVolumeDirectionNone, std::memory_order_release);
     sSN_LastVol = sn_clampf([SNMediaControl currentMediaVolume], 0.0f, 1.0f);
     sSN_VolInit = YES;
     uint32_t dueBase = sn_expected_ms_for_chars(totalChars);
@@ -4117,26 +4254,13 @@ static void sn_apply_tts_volume_policy(uint64_t txn)
     sn_clear_stale_internal_volume_state_for_txn(txn);
     if (sn_volume_restore_keeps_target_for_queued_txn(txn)) return;
 
-    NSUserDefaults *d = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
-
     NSInteger sliderInt = sn_tts_volume_slider_percent_from_prefs();
-
-    BOOL changeWithButtons = [d objectForKey:kSNChangeWithButtonsKey]
-        ? [d boolForKey:kSNChangeWithButtonsKey]
-        : ([d objectForKey:@"useSystemVolume"]
-            ? [d boolForKey:@"useSystemVolume"]
-            : NO);
-    gLastVolumePolicyChangeWithButtons.store(changeWithButtons ? true : false,
-                                             std::memory_order_release);
-
     float curF = sn_clampf([SNMediaControl currentMediaVolume], 0.f, 1.f);
-    int curInt = (int)lroundf(curF * 100.0f);
     float target = ((float)sliderInt) / 100.0f;
-    BOOL willSet = changeWithButtons
-        ? (curInt < (sliderInt - (int)tsk))
-        : (fabsf(curF - target) > (tsk/100.0f));
+    BOOL willSet = (fabsf(curF - target) > (tsk / 100.0f));
 
-    sn_audit_volume_prepare(txn, curF, target, willSet, gPrefResetVolumeAfterSpeak);
+    sn_audit_volume_prepare(txn, curF, target, gPrefResetVolumeAfterSpeak);
+    sn_volume_policy_begin(txn, curF, target, gPrefResetVolumeAfterSpeak);
 
     if (willSet ? DBG_VOL_ON : DBG_VOL_VERBOSE_ON) {
         NSString *route = [SNMediaControl lastOutputPortType] ?: @"-";
@@ -4148,32 +4272,13 @@ static void sn_apply_tts_volume_policy(uint64_t txn)
                  willSet ? @"set" : @"skip");
     }
 
-    if (changeWithButtons) {
-        if (willSet) {
-            sn_volume_restore_capture_for_set(txn, curF, target);
-            sn_mark_internal_volume_set(txn, curF, target, YES);
-            sn_set_system_volume(target);
-            sn_audit_volume_set_requested(txn, target, NO);
-            if (DBG_VOL_ON) SNLOGFMT(@"[VOL] ensure-min SET cwButtons=1 cur=%d%% slider=%ld%% (hyst=%d)",
-                                     curInt, (long)sliderInt, (int)tsk);
-            sn_schedule_post_volume_set_check(txn, curF, target, NO);
-        } else {
-            /*if (DBG_VOL_ON) SNLOGFMT(@"[VOL] ensure-min SKIP cwButtons=1 cur=%d%% slider=%ld%% (hyst=%d)",
-                                     curInt, (long)sliderInt, (int)tsk);*/
-        }
-    } else {
-        if (willSet) {
-            sn_volume_restore_capture_for_set(txn, curF, target);
-            sn_mark_internal_volume_set(txn, curF, target, NO);
-            sn_set_system_volume(target);
-            sn_audit_volume_set_requested(txn, target, NO);
-            if (DBG_VOL_ON) SNLOGFMT(@"[VOL] exact-set SET cwButtons=0 cur=%d%% slider=%ld%% (hyst=%d)",
-                                     curInt, (long)sliderInt, (int)tsk);
-            sn_schedule_post_volume_set_check(txn, curF, target, NO);
-        } else {
-            if (DBG_VOL_ON) SNLOGFMT(@"[VOL] exact-set SKIP cwButtons=0 cur=%d%% slider=%ld%% (hyst=%d)",
-                                     curInt, (long)sliderInt, (int)tsk);
-        }
+    if (willSet) {
+        sn_mark_internal_volume_set(txn, curF, target);
+        sn_set_system_volume(target);
+        sn_audit_volume_set_requested(txn, target, NO);
+        if (DBG_VOL_ON) SNLOGFMT(@"[VOL] speech target SET slider=%ld%% (hyst=%d)",
+                                 (long)sliderInt, (int)tsk);
+        sn_schedule_post_volume_set_check(txn, curF, target, NO);
     }
 }
 
@@ -4878,9 +4983,62 @@ static NSString *sn_a2dp_session_warmup_skip_reason(NSString **outPort,
     if (!SN_ShouldSpeakNow()) return @"interruption";
     if (playing) return @"playing";
     if (otherAudio) return @"otherAudio";
-    uint64_t warmUntilMS = gA2DPWarmUntilMS.load(std::memory_order_acquire);
-    if (respectWarmWindow && warmUntilMS > SN_NowMS()) return @"warm";
+    if (respectWarmWindow) {
+        NSString *deviceUID = sn_current_a2dp_route_uid();
+        uint64_t warmUntilMS = gA2DPWarmUntilMS.load(std::memory_order_acquire);
+        BOOL sameDeviceWarm = NO;
+        os_unfair_lock_lock(&gA2DPWarmStateLock);
+        sameDeviceWarm = (deviceUID.length &&
+                          [gA2DPWarmDeviceUID isEqualToString:deviceUID] &&
+                          warmUntilMS > SN_NowMS());
+        os_unfair_lock_unlock(&gA2DPWarmStateLock);
+        if (sameDeviceWarm) return @"warm";
+    }
     return nil;
+}
+
+static NSDictionary *sn_a2dp_tuning_snapshot_for_txn(uint64_t txn, NSString *deviceUID)
+{
+    if (!txn || deviceUID.length == 0) return nil;
+    NSUserDefaults *defs = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
+    NSDictionary *allTuning = [[defs objectForKey:kSNA2DPDeviceTuningV1Key] isKindOfClass:NSDictionary.class]
+        ? [defs objectForKey:kSNA2DPDeviceTuningV1Key] : @{};
+    NSDictionary *deviceTuning = [allTuning[deviceUID] isKindOfClass:NSDictionary.class] ? allTuning[deviceUID] : @{};
+    id rawWarmup = deviceTuning[@"warmupMs"];
+    id rawKeepWarm = deviceTuning[@"keepWarmMs"];
+    NSUInteger warmupMs = [rawWarmup isKindOfClass:NSNumber.class]
+        ? (NSUInteger)MAX(0, MIN(1000, [(NSNumber *)rawWarmup integerValue])) : kSNA2DPAudioPreRollMs;
+    NSUInteger keepWarmMs = [rawKeepWarm isKindOfClass:NSNumber.class]
+        ? (NSUInteger)MAX(0, MIN(3000, [(NSNumber *)rawKeepWarm integerValue])) : kSNA2DPWarmWindowMs;
+    warmupMs = (warmupMs / 50) * 50;
+    keepWarmMs = (keepWarmMs / 100) * 100;
+    NSDictionary *snapshot = @{
+        @"deviceUID": deviceUID,
+        @"warmupMs": @(warmupMs),
+        @"keepWarmMs": @(keepWarmMs),
+        @"source": (rawWarmup || rawKeepWarm) ? @"device" : @"default"
+    };
+    @synchronized ([SNEngineAV class]) {
+        if (!gA2DPTuningSnapshots) gA2DPTuningSnapshots = [[NSMutableDictionary alloc] init];
+        gA2DPTuningSnapshots[@(txn)] = snapshot;
+    }
+    return snapshot;
+}
+
+static NSDictionary *sn_a2dp_tuning_snapshot_for_existing_txn(uint64_t txn)
+{
+    if (!txn) return nil;
+    @synchronized ([SNEngineAV class]) {
+        return gA2DPTuningSnapshots[@(txn)];
+    }
+}
+
+static void sn_a2dp_tuning_snapshot_remove(uint64_t txn)
+{
+    if (!txn) return;
+    @synchronized ([SNEngineAV class]) {
+        [gA2DPTuningSnapshots removeObjectForKey:@(txn)];
+    }
 }
 
 static void sn_mark_a2dp_warm(uint64_t txn, const char *source)
@@ -4897,14 +5055,33 @@ static void sn_mark_a2dp_warm(uint64_t txn, const char *source)
         return;
     }
 
-    uint64_t warmUntilMS = SN_NowMS() + kSNA2DPWarmWindowMs;
+    NSString *deviceUID = sn_current_a2dp_route_uid();
+    NSDictionary *snapshot = sn_a2dp_tuning_snapshot_for_existing_txn(txn);
+    if (snapshot && ![snapshot[@"deviceUID"] isEqualToString:deviceUID]) {
+        gA2DPWarmUntilMS.store(0, std::memory_order_release);
+        os_unfair_lock_lock(&gA2DPWarmStateLock);
+        [gA2DPWarmDeviceUID release];
+        gA2DPWarmDeviceUID = nil;
+        os_unfair_lock_unlock(&gA2DPWarmStateLock);
+        if (source && strcmp(source, "tts-finish") == 0) sn_a2dp_tuning_snapshot_remove(txn);
+        return;
+    }
+    NSUInteger keepWarmMs = [snapshot[@"keepWarmMs"] unsignedIntegerValue];
+    if (!snapshot || !deviceUID.length) keepWarmMs = kSNA2DPWarmWindowMs;
+    uint64_t warmUntilMS = keepWarmMs ? (SN_NowMS() + keepWarmMs) : 0;
+    os_unfair_lock_lock(&gA2DPWarmStateLock);
+    [gA2DPWarmDeviceUID release];
+    gA2DPWarmDeviceUID = warmUntilMS ? [deviceUID copy] : nil;
+    os_unfair_lock_unlock(&gA2DPWarmStateLock);
     gA2DPWarmUntilMS.store(warmUntilMS, std::memory_order_release);
     if (DBG_ENGINE_VERBOSE_ON) {
-        SNLOGFMT(@"[A2DP] warm state | txn=%llu warmUntil=%llu source=%s",
+        SNLOGFMT(@"[A2DP] warm state | txn=%llu warmUntil=%llu keepWarm=%lums source=%s",
                  (unsigned long long)txn,
                  (unsigned long long)warmUntilMS,
+                 (unsigned long)keepWarmMs,
                  (source ?: "unknown"));
     }
+    if (source && strcmp(source, "tts-finish") == 0) sn_a2dp_tuning_snapshot_remove(txn);
 }
 
 static void sn_abort_a2dp_warmup(uint64_t txn, const char *source, NSString *reason)
@@ -5006,6 +5183,10 @@ static void sn_speak_reserved(NSString *title, NSString *body, NSString *lang, u
     BOOL playing = NO;
     BOOL otherAudio = NO;
     BOOL hfp = NO;
+    NSString *deviceUID = sn_current_a2dp_route_uid();
+    NSDictionary *tuning = sn_a2dp_tuning_snapshot_for_txn(txn, deviceUID);
+    NSUInteger warmupMs = [tuning[@"warmupMs"] unsignedIntegerValue];
+    NSUInteger keepWarmMs = [tuning[@"keepWarmMs"] unsignedIntegerValue];
     NSString *skipReason = sn_a2dp_session_warmup_skip_reason(&port, &playing, &otherAudio, &hfp, YES);
     BOOL callActive = SN_CallMonitorActive();
     BOOL callBlocked = sn_callgate_should_block();
@@ -5015,7 +5196,11 @@ static void sn_speak_reserved(NSString *title, NSString *body, NSString *lang, u
     BOOL newerTxn = (activeTxn != 0 && activeTxn != txn);
     uint64_t nowMS = SN_NowMS();
     uint64_t warmUntilMS = gA2DPWarmUntilMS.load(std::memory_order_acquire);
-    uint64_t warmRemainingMS = (warmUntilMS > nowMS) ? (warmUntilMS - nowMS) : 0;
+    BOOL warmForCurrentDevice = NO;
+    os_unfair_lock_lock(&gA2DPWarmStateLock);
+    warmForCurrentDevice = (deviceUID.length && [gA2DPWarmDeviceUID isEqualToString:deviceUID]);
+    os_unfair_lock_unlock(&gA2DPWarmStateLock);
+    uint64_t warmRemainingMS = (warmForCurrentDevice && warmUntilMS > nowMS) ? (warmUntilMS - nowMS) : 0;
     if (DBG_ENGINE_VERBOSE_ON) {
         SNLOGFMT(@"[A2DP] gate | txn=%llu route=%@ playing=%d otherAudio=%d hfp=%d car=%d call=%d speaking=%d owner=%d newerTxn=%d warmRemainingMs=%llu",
                  (unsigned long long)txn,
@@ -5029,11 +5214,22 @@ static void sn_speak_reserved(NSString *title, NSString *body, NSString *lang, u
                  (int)sn_start_txn_is_owned(txn),
                  (int)newerTxn,
                  (unsigned long long)warmRemainingMS);
+        if (tuning) {
+            SNLOGFMT(@"[A2DP] tuning | txn=%llu uid=%@ warmup=%lums keepWarm=%lums source=%@",
+                     (unsigned long long)txn, deviceUID,
+                     (unsigned long)warmupMs, (unsigned long)keepWarmMs,
+                     tuning[@"source"]);
+        }
     }
     if (skipReason.length) {
         if (DBG_ENGINE_VERBOSE_ON) {
             SNLOGFMT(@"[A2DP] skip | txn=%llu reason=%@", (unsigned long long)txn, skipReason);
         }
+        sn_start_engine_speak_reserved(title, body, lang, txn);
+        return;
+    }
+
+    if (warmupMs == 0) {
         sn_start_engine_speak_reserved(title, body, lang, txn);
         return;
     }
@@ -5048,8 +5244,8 @@ static void sn_speak_reserved(NSString *title, NSString *body, NSString *lang, u
     gA2DPSessionWarmupAttemptedTxn.store(txn, std::memory_order_release);
 
     if (DBG_ENGINE_VERBOSE_ON) {
-        SNLOGFMT(@"[A2DP] warmup plan | txn=%llu route=%@ duration=400ms kind=zeros",
-                 (unsigned long long)txn, port);
+        SNLOGFMT(@"[A2DP] warmup plan | txn=%llu route=%@ duration=%lums kind=zeros",
+                 (unsigned long long)txn, port, (unsigned long)warmupMs);
     }
 
     BOOL prepared = [SNEngineAV prepareVoicePromptForRoute:SNMixRouteBluetooth duckOthers:NO];
@@ -5081,7 +5277,7 @@ static void sn_speak_reserved(NSString *title, NSString *body, NSString *lang, u
     NSString *failureStage = nil;
     NSString *failureError = nil;
     BOOL playerStarted = [SNEngineAV beginA2DPWarmupForTransaction:txn
-                                                           duration:((NSTimeInterval)kSNA2DPAudioPreRollMs / 1000.0)
+                                                           duration:((NSTimeInterval)warmupMs / 1000.0)
                                                         bufferBytes:&bufferBytes
                                                          sampleRate:&sampleRate
                                                          playerInitialized:&playerInitialized
@@ -5093,6 +5289,7 @@ static void sn_speak_reserved(NSString *title, NSString *body, NSString *lang, u
                                                                    BOOL guardOtherAudio = NO;
                                                                    BOOL guardHFP = NO;
                                                                    return (sn_start_txn_is_owned(guardedTxn) &&
+                                                                           [sn_current_a2dp_route_uid() isEqualToString:deviceUID] &&
                                                                            !sn_a2dp_session_warmup_skip_reason(&guardPort,
                                                                                                                &guardPlaying,
                                                                                                                &guardOtherAudio,
@@ -5131,8 +5328,9 @@ static void sn_speak_reserved(NSString *title, NSString *body, NSString *lang, u
                                                                                (unsigned long)startedBytes,
                                                                                startedSampleRate);
                                                                   }
-                                                                  SNLOGFMT(@"[A2DP] pre-roll | txn=%llu duration=400ms",
-                                                                           (unsigned long long)txn);
+                                                                  SNLOGFMT(@"[A2DP] pre-roll | txn=%llu duration=%lums",
+                                                                           (unsigned long long)txn,
+                                                                           (unsigned long)warmupMs);
                                                               } else {
                                                                   SNLOGFMT(@"[A2DP] failure | txn=%llu stage=%@ error=%@",
                                                                            (unsigned long long)txn,
@@ -5545,7 +5743,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.4";
+static NSString * const kReleaseInstalledVersion = @"2.1.5";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
@@ -7976,45 +8174,41 @@ static uint64_t SN_Seq = 0;
 - (void)volumeIncreasePress:(id)press
 {
     (void)press;
-    if ([SNCancellation isSpeaking] &&
-        sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
-        gLastPhysicalVolumeDirection.store(SNVolumeDirectionUp, std::memory_order_release);
-    }
-    sn_handle_cancel_candidate("VolumeButton", @"volumeUp", SNCancelCandidateVolume);
+    sn_volume_restore_note_physical_cancel_baseline();
+    BOOL rememberSpeechVolume = sn_volume_memory_begin_physical_button();
     %orig(press);
+    sn_handle_cancel_candidate("VolumeButton", @"volumeUp", SNCancelCandidateVolume);
+    if (rememberSpeechVolume) sn_volume_memory_commit_physical_button();
 }
 
 - (void)volumeDecreasePress:(id)press
 {
     (void)press;
-    if ([SNCancellation isSpeaking] &&
-        sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
-        gLastPhysicalVolumeDirection.store(SNVolumeDirectionDown, std::memory_order_release);
-    }
-    sn_handle_cancel_candidate("VolumeButton", @"volumeDown", SNCancelCandidateVolume);
+    sn_volume_restore_note_physical_cancel_baseline();
+    BOOL rememberSpeechVolume = sn_volume_memory_begin_physical_button();
     %orig(press);
+    sn_handle_cancel_candidate("VolumeButton", @"volumeDown", SNCancelCandidateVolume);
+    if (rememberSpeechVolume) sn_volume_memory_commit_physical_button();
 }
 %end
 
 %hook SBVolumeControl
 - (void)increaseVolume
 {
-    if ([SNCancellation isSpeaking] &&
-        sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
-        gLastPhysicalVolumeDirection.store(SNVolumeDirectionUp, std::memory_order_release);
-    }
-    sn_handle_cancel_candidate("VolumeButton", @"volumeUp", SNCancelCandidateVolume);
+    sn_volume_restore_note_physical_cancel_baseline();
+    BOOL rememberSpeechVolume = sn_volume_memory_begin_physical_button();
     %orig;
+    sn_handle_cancel_candidate("VolumeButton", @"volumeUp", SNCancelCandidateVolume);
+    if (rememberSpeechVolume) sn_volume_memory_commit_physical_button();
 }
 
 - (void)decreaseVolume
 {
-    if ([SNCancellation isSpeaking] &&
-        sn_cancel_mode_accepts_volume([SNCancellation cancelMode])) {
-        gLastPhysicalVolumeDirection.store(SNVolumeDirectionDown, std::memory_order_release);
-    }
-    sn_handle_cancel_candidate("VolumeButton", @"volumeDown", SNCancelCandidateVolume);
+    sn_volume_restore_note_physical_cancel_baseline();
+    BOOL rememberSpeechVolume = sn_volume_memory_begin_physical_button();
     %orig;
+    sn_handle_cancel_candidate("VolumeButton", @"volumeDown", SNCancelCandidateVolume);
+    if (rememberSpeechVolume) sn_volume_memory_commit_physical_button();
 }
 
 - (void)setMediaVolume:(float)value
@@ -8111,6 +8305,10 @@ static inline BOOL sn_is_carplay_host_process(void)
         }
         if (!sn_a2dp_warmup_route_is_still_valid()) {
             gA2DPWarmUntilMS.store(0, std::memory_order_release);
+            os_unfair_lock_lock(&gA2DPWarmStateLock);
+            [gA2DPWarmDeviceUID release];
+            gA2DPWarmDeviceUID = nil;
+            os_unfair_lock_unlock(&gA2DPWarmStateLock);
         }
     }];
 

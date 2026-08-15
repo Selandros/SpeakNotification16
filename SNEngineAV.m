@@ -566,11 +566,11 @@ static void SNRecordVoiceAttempt(NSString *language,
 
     __unsafe_unretained SNEngineAV *me = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)((duration + 0.25) * NSEC_PER_SEC)),
+                                 (int64_t)(duration * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!me || me.a2dpWarmupGeneration != generation ||
             me.a2dpWarmupTransaction != transaction) return;
-        [me sn_finishA2DPWarmupForTransaction:transaction completed:NO reason:@"timeout"];
+        [me sn_finishA2DPWarmupForTransaction:transaction completed:YES reason:@"deadline"];
     });
     return YES;
 }

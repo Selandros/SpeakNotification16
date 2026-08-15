@@ -32,9 +32,6 @@ extern NSString * const kKeyInterruptionTailMs;   // INT 0–2000 (milliseconds)
 // speechVolume: user slider 0–100 (hysteresis ±1 applied by caller)
 @property (atomic, assign, readonly) NSInteger speechVolume;
 
-// useSystemVolume: when ON, raise to at least slider; when OFF, set exact slider value.
-@property (atomic, assign, readonly) BOOL useSystemVolume;
-
 // resetVolumeAfterSpeakEnabled: restore captured media volume after the final queued speech.
 @property (atomic, assign, readonly) BOOL resetVolumeAfterSpeakEnabled;
 

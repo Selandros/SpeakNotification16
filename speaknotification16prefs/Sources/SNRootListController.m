@@ -9,6 +9,7 @@
 #import <UIKit/UIKit.h>
 #import "SNPrefsUtil.h"
 #import "SNPreferences.h"
+#import "SNBluetoothTuningController.h"
 
 static NSString * const kSNLogPath = @"/var/mobile/Library/Logs/log_speaknotification16.txt";
 static NSString * const kReadIncomingKey = @"readIncomingCalls";
@@ -723,6 +724,7 @@ static BOOL SNIsSpeakLogFile(NSString *filename) {
 @interface SNRootListController ()
 @property (nonatomic, strong) NSMutableArray<NSString *> *wifiItems; // ARC: strong instead of retain
 @property (nonatomic, strong) NSMutableArray<NSString *> *btItems;   // ARC: strong instead of retain
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *bluetoothDeviceUIDs;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *wiredAudioItems;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *connectionAliases;
 @property (nonatomic, copy) NSString *manualReleaseCheckRequestID;
@@ -739,6 +741,7 @@ static BOOL SNIsSpeakLogFile(NSString *filename) {
 - (void)sn_rebuildReleaseStatusSpecifier;
 - (BOOL)sn_debugLoggingEnabled;
 - (void)sn_updateBetaAccessVisibilityAnimated:(BOOL)animated;
+- (void)sn_refreshSpeechVolumeSpecifier;
 @end
 
 static void SNReleaseCheckResultChanged(__unused CFNotificationCenterRef center,
@@ -767,6 +770,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     if (!controller) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         [controller sn_updateBetaAccessVisibilityAnimated:YES];
+        [controller sn_refreshSpeechVolumeSpecifier];
     });
 }
 
@@ -785,6 +789,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     NSArray *bts = [defs objectForKey:kBTKey];
     NSArray *wiredAudio = [defs objectForKey:kWiredAudioDevicesV2Key];
     NSDictionary *aliases = [defs objectForKey:kTrustedConnectionAliasesV1Key];
+    NSDictionary *bluetoothUIDs = [defs objectForKey:kSNBluetoothDeviceUIDsV1Key];
 
     self.wifiItems = [ssids isKindOfClass:NSArray.class]
         ? [ssids mutableCopy]
@@ -793,6 +798,10 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     self.btItems = [bts isKindOfClass:NSArray.class]
         ? [bts mutableCopy]
         : [NSMutableArray array];
+
+    self.bluetoothDeviceUIDs = [bluetoothUIDs isKindOfClass:NSDictionary.class]
+        ? [bluetoothUIDs mutableCopy]
+        : [NSMutableDictionary dictionary];
 
     self.connectionAliases = [NSMutableDictionary dictionary];
     if ([aliases isKindOfClass:NSDictionary.class]) {
@@ -1008,6 +1017,17 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
             [specifier setProperty:[SNFormatValueCell class] forKey:@"cellClass"];
         } else if ([sid isEqualToString:@"global_format_tokens"]) {
             [specifier setProperty:[SNFormatTokensCell class] forKey:@"cellClass"];
+        }
+    }
+}
+
+- (void)sn_refreshSpeechVolumeSpecifier
+{
+    if (!self.isViewLoaded || !self.view.window) return;
+    for (PSSpecifier *specifier in _specifiers) {
+        if ([[specifier propertyForKey:@"key"] isEqualToString:@"speechVolume"]) {
+            [self reloadSpecifier:specifier animated:NO];
+            return;
         }
     }
 }
@@ -1745,6 +1765,12 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
         if (text.length == 0) return;
         if (![self.btItems containsObject:text]) {
             [self.btItems addObject:text];
+            for (AVAudioSessionPortDescription *output in AVAudioSession.sharedInstance.currentRoute.outputs) {
+                if (![output.portName isEqualToString:text] || ![output.portType isEqualToString:AVAudioSessionPortBluetoothA2DP]) continue;
+                NSString *uid = SNCanonicalBluetoothDeviceUID(output.UID);
+                if (uid.length) self.bluetoothDeviceUIDs[text] = uid;
+                break;
+            }
             [self saveListsAndReload];
         }
     }];
@@ -1990,6 +2016,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
     [defs setObject:self.wifiItems forKey:kSSIDsKey];
     [defs setObject:self.btItems forKey:kBTKey];
+    [defs setObject:self.bluetoothDeviceUIDs ?: @{} forKey:kSNBluetoothDeviceUIDsV1Key];
     [defs setObject:self.wiredAudioItems forKey:kWiredAudioDevicesV2Key];
     [defs setObject:self.connectionAliases ?: @{} forKey:kTrustedConnectionAliasesV1Key];
     [defs synchronize];
@@ -2035,6 +2062,36 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
         return;
     }
 
+    if ([type isEqualToString:@"bt"]) {
+        NSString *canonicalUID = SNCanonicalBluetoothDeviceUID(self.bluetoothDeviceUIDs[identity]);
+        BOOL resolvedLegacyUID = NO;
+        if (canonicalUID.length == 0) {
+            for (AVAudioSessionPortDescription *output in AVAudioSession.sharedInstance.currentRoute.outputs) {
+                if (![output.portName isEqualToString:identity] || ![output.portType isEqualToString:AVAudioSessionPortBluetoothA2DP]) continue;
+                canonicalUID = SNCanonicalBluetoothDeviceUID(output.UID);
+                if (canonicalUID.length) {
+                    self.bluetoothDeviceUIDs[identity] = canonicalUID;
+                    resolvedLegacyUID = YES;
+                }
+                break;
+            }
+        }
+        if (resolvedLegacyUID) {
+            NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+            [defs setObject:self.bluetoothDeviceUIDs forKey:kSNBluetoothDeviceUIDsV1Key];
+            [defs synchronize];
+            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), kSNPrefsNotify, NULL, NULL, true);
+        }
+        NSString *displayName = SNConnectionDisplayName(@"bluetooth", identity, identity, self.connectionAliases);
+        __weak typeof(self) weakSelf = self;
+        SNBluetoothTuningController *controller = [[SNBluetoothTuningController alloc] initWithSavedName:identity displayName:displayName canonicalUID:canonicalUID changeHandler:^{
+            [weakSelf rebuildInlineLists];
+            [weakSelf reloadSpecifiers];
+        }];
+        [self.navigationController pushViewController:controller animated:YES];
+        return;
+    }
+
     NSString *aliasKey = [typeLabel isEqualToString:@"wired"] ? identity : SNConnectionAliasKey(typeLabel, identity);
     NSString *displayName = SNConnectionDisplayName(typeLabel, identity, defaultName, self.connectionAliases);
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Rename Trusted Connection"
@@ -2060,6 +2117,7 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
             if (idx < weakSelf.wifiItems.count) [weakSelf.wifiItems removeObjectAtIndex:idx];
         } else if ([type isEqualToString:@"bt"]) {
             if (idx < weakSelf.btItems.count) [weakSelf.btItems removeObjectAtIndex:idx];
+            [weakSelf.bluetoothDeviceUIDs removeObjectForKey:identity];
         } else if ([type isEqualToString:@"wired"]) {
             if (idx < weakSelf.wiredAudioItems.count) [weakSelf.wiredAudioItems removeObjectAtIndex:idx];
         }
@@ -2120,7 +2178,6 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
             // Voice & Volume
             @"voiceLang": @"auto",
             @"speechVolume": @30,
-            @"useSystemVolume": @NO,
             @"SNResetVolumeAfterSpeakEnabled": @NO,
             @"bluetoothMonoAudio": @NO,
 
@@ -2162,6 +2219,8 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
             // Inline lists
             kSSIDsKey: @[],
             kBTKey: @[],
+            kSNBluetoothDeviceUIDsV1Key: @{},
+            kSNA2DPDeviceTuningV1Key: @{},
             kWiredAudioDevicesKey: @[],
             kWiredAudioDevicesV2Key: @[],
             kAllowAnyWiredAudioDeviceKey: @NO,
@@ -2181,6 +2240,7 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
 
         weakSelf.wifiItems = [NSMutableArray array];
         weakSelf.btItems   = [NSMutableArray array];
+        weakSelf.bluetoothDeviceUIDs = [NSMutableDictionary dictionary];
         weakSelf.wiredAudioItems = [NSMutableArray array];
         weakSelf.connectionAliases = [NSMutableDictionary dictionary];
 

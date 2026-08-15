@@ -26,7 +26,6 @@ static NSString * const kKeySpamCooldownSeconds  = @"spamCooldownSeconds";
 // ---- Core behavior keys ----
 static NSString * const kKeyPause                = @"pause";           // BOOL (default NO)
 static NSString * const kKeySpeechVolume         = @"speechVolume";    // INT 0â€“100
-static NSString * const kKeyUseSystemVolume      = @"useSystemVolume"; // BOOL
 static NSString * const kKeyResetVolumeAfterSpeak = @"SNResetVolumeAfterSpeakEnabled"; // BOOL
 
 // ---- Debug master + domains ----
@@ -52,7 +51,6 @@ NSString * const kKeyInterruptionTailMs   = @"interruptionTailMs";    // INT 0â€
     // Backing storage for readonly properties
     BOOL _pauseEnabled;
     NSInteger _speechVolume;
-    BOOL _useSystemVolume;
     BOOL _resetVolumeAfterSpeakEnabled;
 
     BOOL _debugEnabled;
@@ -116,7 +114,6 @@ NSString * const kKeyInterruptionTailMs   = @"interruptionTailMs";    // INT 0â€
         // Core behavior (match plist)
         _pauseEnabled = NO;
         _speechVolume = 30;               // 30 %
-        _useSystemVolume = NO;            // Match plist default.
         _resetVolumeAfterSpeakEnabled = NO;
 
         // Debug
@@ -274,18 +271,15 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
     {
         NSNumber *pauseObj = [defs objectForKey:kKeyPause];
         NSNumber *volObj   = [defs objectForKey:kKeySpeechVolume];
-        NSNumber *useSys   = [defs objectForKey:kKeyUseSystemVolume];
         NSNumber *resetVol = [defs objectForKey:kKeyResetVolumeAfterSpeak];
 
         BOOL pause = [pauseObj isKindOfClass:NSNumber.class] ? pauseObj.boolValue : NO;
         NSInteger sv = [volObj isKindOfClass:NSNumber.class] ? volObj.integerValue : 30;
         if (sv < 0) sv = 0; if (sv > 100) sv = 100;
-        BOOL useSystem = [useSys isKindOfClass:NSNumber.class] ? useSys.boolValue : NO;
         BOOL resetAfterSpeak = [resetVol isKindOfClass:NSNumber.class] ? resetVol.boolValue : NO;
 
         self->_pauseEnabled = pause;
         self->_speechVolume = sv;
-        self->_useSystemVolume = useSystem;
         self->_resetVolumeAfterSpeakEnabled = resetAfterSpeak;
     }
 
@@ -348,7 +342,6 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
                                                       userInfo:@{
         @"pauseEnabled": @(_pauseEnabled),
         @"speechVolume": @(_speechVolume),
-        @"useSystemVolume": @(_useSystemVolume),
         @"resetVolumeAfterSpeakEnabled": @(_resetVolumeAfterSpeakEnabled),
         @"debugEnabled": @(_debugEnabled),
         @"muteSpamEnabled": @(_muteSpamEnabled),
@@ -381,7 +374,6 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
 // Core behavior
 - (BOOL)pauseEnabled { return _pauseEnabled; }
 - (NSInteger)speechVolume { return _speechVolume; }
-- (BOOL)useSystemVolume { return _useSystemVolume; }
 - (BOOL)resetVolumeAfterSpeakEnabled { return _resetVolumeAfterSpeakEnabled; }
 
 // Debug flags
@@ -460,7 +452,6 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
         // Core behavior
         @"pauseEnabled": @(_pauseEnabled),
         @"speechVolume": @(_speechVolume),
-        @"useSystemVolume": @(_useSystemVolume),
         @"resetVolumeAfterSpeakEnabled": @(_resetVolumeAfterSpeakEnabled),
 
         // Debug flags

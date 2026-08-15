@@ -18,6 +18,8 @@ NSString * const kSNLastSpokenAppIDKey = @"lastSpokenAppID";
 NSString * const kSNSelectedVoiceIdentifierByLanguageKey = @"selectedVoiceIdentifierByLanguage";
 NSString * const kSNLastUsedVoiceByLanguageKey = @"lastUsedVoiceByLanguage";
 NSString * const kBTKey = @"trustedBTDevices";
+NSString * const kSNBluetoothDeviceUIDsV1Key = @"trustedBluetoothDeviceUIDsV1";
+NSString * const kSNA2DPDeviceTuningV1Key = @"a2dpDeviceTuningV1";
 NSString * const kSSIDsKey = @"trustedSSIDs";
 NSString * const kWiredAudioDevicesKey = @"trustedWiredAudioDevices";
 NSString * const kWiredAudioDevicesV2Key = @"trustedWiredAudioDevicesV2";
@@ -71,6 +73,24 @@ NSString *SNCanonicalWiredAudioUID(NSString *portType, NSString *rawUID)
                                                                     range:NSMakeRange(0, rawUID.length)];
     if (!match || match.numberOfRanges < 2) return rawUID;
     return [rawUID substringWithRange:[match rangeAtIndex:1]];
+}
+
+BOOL SNIsUsableBluetoothDeviceUID(NSString *uid)
+{
+    if (![uid isKindOfClass:NSString.class]) return NO;
+    NSString *value = [uid stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (value.length == 0) return NO;
+    NSArray<NSString *> *placeholders = @[@"-", @"unknown", @"none", @"null", @"n/a", @"default", @"speaker", @"receiver"];
+    for (NSString *placeholder in placeholders) {
+        if ([value caseInsensitiveCompare:placeholder] == NSOrderedSame) return NO;
+    }
+    return YES;
+}
+
+NSString *SNCanonicalBluetoothDeviceUID(NSString *rawUID)
+{
+    if (!SNIsUsableBluetoothDeviceUID(rawUID)) return @"";
+    return [rawUID stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
 NSString *SNNormalizeVoiceLanguage(NSString *language)

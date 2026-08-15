@@ -17,12 +17,19 @@ extern NSString * const kSNLastSpokenAppIDKey;
 extern NSString * const kSNSelectedVoiceIdentifierByLanguageKey;
 extern NSString * const kSNLastUsedVoiceByLanguageKey;
 extern NSString * const kBTKey;
+extern NSString * const kSNBluetoothDeviceUIDsV1Key;
+extern NSString * const kSNA2DPDeviceTuningV1Key;
 extern NSString * const kSSIDsKey;
 extern NSString * const kWiredAudioDevicesKey;
 extern NSString * const kWiredAudioDevicesV2Key;
 extern NSString * const kAllowAnyWiredAudioDeviceKey;
 extern NSString * const kWiredAudioDiagnosticKey;
 extern NSString * const kTrustedConnectionAliasesV1Key;
+
+typedef NS_ENUM(NSUInteger, SNA2DPDefaultTiming) {
+    kSNA2DPDefaultWarmupMs = 200,
+    kSNA2DPDefaultKeepWarmMs = 1200,
+};
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +40,8 @@ BOOL SNIsTrustedWiredAudioPortType(NSString *portType);
 NSString *SNTrustedWiredAudioPortTypeLabel(NSString *portType);
 BOOL SNIsUsableWiredAudioUID(NSString *uid);
 NSString *SNCanonicalWiredAudioUID(NSString *portType, NSString *rawUID);
+BOOL SNIsUsableBluetoothDeviceUID(NSString *uid);
+NSString *SNCanonicalBluetoothDeviceUID(NSString *rawUID);
 
 #ifdef __cplusplus
 }
