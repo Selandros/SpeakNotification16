@@ -1674,7 +1674,7 @@ static BOOL sn_audit_write_notif(NSDictionary *s, NSString *txnText)
            s[@"voiceIdentifier"] ?: @"-",
            s[@"voiceSource"] ?: @"-",
            s[@"voiceQuality"] ?: @"-"];
-    SNLOGFMT(@"[NOTIF] %02llu | txn=%@ sectionID=%@ title_len=%@ subtitle_len=%@ body_len=%@ | wifi=%@ bt=%@ wired=%@ broadWired=%@ trust=%@ trustedBy=%@ callGate=%@ | route=%@ otherAudio=%@ volume=%@%% muted=%@ locked=%@ fg=%@ screen=%@ battery=%@ | sound=%@ fmt=%@ | lang=%@ %@ | policy=%@ queue=%@ action=%@ result=%@ voice=%@",
+    SNLOGFMT(@"[NOTIF] %02llu | txn=%@ sectionID=%@ title_len=%@ subtitle_len=%@ body_len=%@ | wifi=%@ bt=%@ wired=%@ broadWired=%@ trust=%@ trustedBy=%@ callGate=%@ | route=%@ otherAudio=%@ volume=%@%% muted=%@ locked=%@ fg=%@ screen=%@ battery=%@ | sound=%@ fmt=%@ | lang=%@ %@ | policy=%@ queue=%@ filter=%@ action=%@ result=%@ voice=%@",
              [s[@"seq"] unsignedLongLongValue], txnText ?: @"-",
              s[@"sectionID"] ?: @"-", s[@"titleLen"] ?: @0, s[@"subtitleLen"] ?: @0, s[@"bodyLen"] ?: @0,
              s[@"wifi"] ?: @"-", s[@"bluetooth"] ?: @"-", s[@"wired"] ?: @"-", s[@"broadWired"] ?: @"-",
@@ -1682,7 +1682,7 @@ static BOOL sn_audit_write_notif(NSDictionary *s, NSString *txnText)
              s[@"route"] ?: @"-", s[@"otherAudio"] ?: @"-", s[@"volume"] ?: @"-", s[@"muted"] ?: @"-", s[@"locked"] ?: @"-",
              s[@"foreground"] ?: @"-", s[@"screen"] ?: @"-", s[@"battery"] ?: @"-", s[@"sound"] ?: @"-",
              s[@"format"] ?: @"-", s[@"lang"] ?: @"-", languageText, s[@"policy"] ?: @"-", s[@"queue"] ?: @"-",
-             s[@"action"] ?: @"-", s[@"result"] ?: @"-",
+             s[@"filter"] ?: @"none", s[@"action"] ?: @"-", s[@"result"] ?: @"-",
              voiceText);
     return YES;
 }
@@ -1817,6 +1817,67 @@ static inline BOOL sn_isPhoneMediaNowPlaying(void);
 static inline NSString *SN_AppDisplayNameForSection(NSString *sectionID, id bulletin);
 static inline BOOL SN_PrefBoolFast(NSString *key, BOOL def);
 static inline NSString *sn_normalized_app_counter_key(NSString *bundleID);
+
+/* Filter evaluation is deliberately independent from formatting and voice choice. */
+static NSDictionary *sn_evaluate_notification_filter(NSString *bundleID,
+                                                       NSString *title,
+                                                       NSString *subtitle,
+                                                       NSString *body)
+{
+    NSString *key = sn_normalized_app_counter_key(bundleID);
+    if (key.length == 0) return @{ @"kind": @"none" };
+    NSUserDefaults *defs = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
+    NSDictionary *all = [defs objectForKey:kSNPerAppNotificationFiltersV1Key];
+    NSArray *raw = [all isKindOfClass:NSDictionary.class] ? all[key] : nil;
+    if (![raw isKindOfClass:NSArray.class] || raw.count == 0) return @{ @"kind": @"none" };
+
+    NSString *searchable = [NSString stringWithFormat:@"%@\n%@\n%@",
+                            [title isKindOfClass:NSString.class] ? title : @"",
+                            [subtitle isKindOfClass:NSString.class] ? subtitle : @"",
+                            [body isKindOfClass:NSString.class] ? body : @""];
+    NSMutableArray *matches = [NSMutableArray array];
+    NSUInteger validRuleCount = 0;
+    for (id value in raw) {
+        if (![value isKindOfClass:NSDictionary.class]) continue;
+        NSString *match = [value[@"match"] isKindOfClass:NSString.class]
+            ? [value[@"match"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+        NSString *action = [value[@"action"] isKindOfClass:NSString.class]
+            ? [value[@"action"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+        if (match.length == 0) continue;
+        if (![action isEqualToString:kSNNotificationFilterActionDontSpeak] &&
+            ![action isEqualToString:kSNNotificationFilterActionSpeakNotification] &&
+            ![action isEqualToString:kSNNotificationFilterActionSpeakMatched] &&
+            ![action isEqualToString:kSNNotificationFilterActionSpeakCustom]) continue;
+        NSString *custom = [value[@"customText"] isKindOfClass:NSString.class]
+            ? [value[@"customText"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+        if ([action isEqualToString:kSNNotificationFilterActionSpeakCustom] && custom.length == 0) continue;
+        validRuleCount++;
+        if ([searchable rangeOfString:match options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        [matches addObject:@{ @"action": action, @"match": match, @"custom": custom }];
+    }
+    for (NSDictionary *match in matches) {
+        if ([match[@"action"] isEqualToString:kSNNotificationFilterActionDontSpeak]) {
+            return @{ @"kind": @"deny", @"audit": @"denyMatched" };
+        }
+    }
+    if (matches.count) {
+        NSDictionary *match = matches.firstObject;
+        NSString *action = match[@"action"];
+        if ([action isEqualToString:kSNNotificationFilterActionSpeakNotification]) {
+            return @{ @"kind": @"speak", @"action": action, @"audit": @"allowMatched" };
+        }
+        NSString *text = [action isEqualToString:kSNNotificationFilterActionSpeakCustom]
+            ? match[@"custom"] : match[@"match"];
+        return @{ @"kind": @"speak", @"action": action, @"text": text,
+                  @"audit": [action isEqualToString:kSNNotificationFilterActionSpeakCustom] ? @"speakCustom" : @"speakMatched" };
+    }
+    NSDictionary *onlyAll = [defs objectForKey:kSNPerAppOnlySpeakMatchingFiltersV1Key];
+    BOOL onlyMatching = [onlyAll isKindOfClass:NSDictionary.class] && [onlyAll[key] boolValue];
+    if (onlyMatching && validRuleCount > 0) {
+        return @{ @"kind": @"deny", @"audit": @"denyUnmatched" };
+    }
+    return @{ @"kind": @"none" };
+}
 static void SN_CancelAll(const char *source);
 static inline BOOL sn_cancel_buttons_armed_now(void);
 static inline BOOL sn_cancel_target_active_now(void);
@@ -5743,7 +5804,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.5";
+static NSString * const kReleaseInstalledVersion = @"2.1.6";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
@@ -7775,6 +7836,7 @@ static uint64_t SN_Seq = 0;
             NSString *battState = SN_BatteryStateString(UIDevice.currentDevice.batteryState);
             BOOL lpm = SN_LowPowerModeEnabled();
             NSDictionary *auditIngress = nil;
+            NSDictionary *filterDecision = nil;
 
             if (allowTTS) {
                 NSUserDefaults *defs = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
@@ -7808,7 +7870,7 @@ static uint64_t SN_Seq = 0;
                     @"callGate": @"notEvaluated", @"sound": @"notAttempted",
                     @"format": @"notEvaluated", @"lang": @"notEvaluated",
                     @"langReason": @"notEvaluated", @"langDiagnostic": @"notEvaluated",
-                    @"voiceName": @"notEvaluated", @"action": @"notEvaluated", @"result": @"notEvaluated"
+                    @"voiceName": @"notEvaluated", @"filter": @"none", @"action": @"notEvaluated", @"result": @"notEvaluated"
                 };
 
                 if (!blocked && onlyTrusted) {
@@ -7933,6 +7995,18 @@ static uint64_t SN_Seq = 0;
                     }
                 }
 
+                filterDecision = sn_evaluate_notification_filter(sectionID, title, subtitle, body);
+                if ([filterDecision[@"kind"] isEqualToString:@"deny"]) {
+                    NSMutableDictionary *filterAudit = [auditIngress mutableCopy];
+                    filterAudit[@"filter"] = filterDecision[@"audit"] ?: @"denyMatched";
+                    auditIngress = [filterAudit autorelease];
+                    allowTTS = NO;
+                    sn_audit_emit_denied(auditIngress, @"filterDenied");
+                    didOrig = YES;
+                    %orig(bulletin, destinations);
+                    return;
+                }
+
             }
 
             NSString *auditSound = @"notAttempted";
@@ -7973,9 +8047,11 @@ static uint64_t SN_Seq = 0;
                     subtitle = [SNStringUtils stripEmoji:subtitle];
                     msg      = [SNStringUtils stripEmoji:msg];
                 }
-                msg = [SNStringUtils sanitizeForTTS:msg];
-                NSString *languageSource = bodySan.length ? @"body" : (title.length ? @"title" : @"subtitle");
-                NSString *languageSourceText = bodySan.length ? bodySan : (title.length ? title : subtitle ?: @"");
+                NSString *filterText = filterDecision[@"text"];
+                msg = filterText.length ? [SNStringUtils sanitizeForTTS:filterText]
+                                         : [SNStringUtils sanitizeForTTS:msg];
+                NSString *languageSource = filterText.length ? @"filter" : (bodySan.length ? @"body" : (title.length ? @"title" : @"subtitle"));
+                NSString *languageSourceText = filterText.length ? filterText : (bodySan.length ? bodySan : (title.length ? title : subtitle ?: @""));
                 NSString *detectedLanguage = nil;
                 NSString *languageReason = nil;
                 NSString *languageDiagnostic = nil;
@@ -7993,6 +8069,8 @@ static uint64_t SN_Seq = 0;
                 auditMutable[@"lang"] = bcp47 ?: @"-";
                 auditMutable[@"langReason"] = languageReason ?: @"-";
                 auditMutable[@"langDiagnostic"] = languageDiagnostic ?: @"-";
+                auditMutable[@"filter"] = [filterDecision[@"kind"] isEqualToString:@"speak"]
+                    ? [NSString stringWithFormat:@"allowMatched action=%@", filterDecision[@"action"] ?: @"-"] : @"none";
                 auditMutable[@"callGate"] = @"allow";
                 auditPlan = [auditMutable autorelease];
 #if !__has_feature(objc_arc)

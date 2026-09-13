@@ -2192,9 +2192,6 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
             // Speech rate
             @"speechRate": @1.0,
 
-            // Filter
-            @"filterWords": @"",
-
             // Message format
             @"globalFormat": @"{APP}: {TITLE}: {BODY}",
             @"messageFormat": @"{APP}: {TITLE}: {BODY}",

@@ -13,6 +13,7 @@ SpeakNotification16Prefs_FILES = ../SNSharedKeys.m \
     Sources/SNPrefsUtil.m \
     Sources/SNRootListController.m \
     Sources/PerAppListController.m \
+    Sources/SNNotificationFilterController.m \
     Sources/WifiListController.m \
     Sources/BtListController.m \
     Sources/SNBluetoothTuningController.m \

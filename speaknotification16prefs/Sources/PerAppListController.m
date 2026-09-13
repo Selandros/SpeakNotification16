@@ -12,6 +12,7 @@
 #import "SNAppListProvider.h"
 #import "SNPrefsUtil.h"
 #import "SNPreferences.h"
+#import "SNNotificationFilterController.h"
 
 
 static NSString * const kSNPerAppDisableSoundKey = @"perAppDisableNotificationSound";
@@ -856,6 +857,19 @@ if (cached) {
     [strip setProperty:bundleID forKey:@"id"];
     [strip setProperty:@"com.selandros.speaknotification16/prefsChanged" forKey:@"PostNotification"];
     [specs addObject:strip];
+
+    PSSpecifier *filterGroup = [PSSpecifier preferenceSpecifierNamed:@"Notification Filters"
+                                                               target:self set:NULL get:NULL
+                                                               detail:nil cell:PSGroupCell edit:nil];
+    [filterGroup setProperty:@"Choose whether matching notifications are blocked or spoken as a phrase or custom text." forKey:@"footerText"];
+    [specs addObject:filterGroup];
+
+    PSSpecifier *filters = [PSSpecifier preferenceSpecifierNamed:@"Edit Notification Filters"
+                                                           target:self set:NULL get:NULL
+                                                           detail:[SNNotificationFilterListController class]
+                                                             cell:PSLinkCell edit:nil];
+    [filters setProperty:bundleID forKey:@"bundleID"];
+    [specs addObject:filters];
 
     PSSpecifier *formatGroup = [PSSpecifier preferenceSpecifierNamed:@"Custom Message"
                                                               target:self set:NULL get:NULL

@@ -25,6 +25,12 @@ extern NSString * const kWiredAudioDevicesV2Key;
 extern NSString * const kAllowAnyWiredAudioDeviceKey;
 extern NSString * const kWiredAudioDiagnosticKey;
 extern NSString * const kTrustedConnectionAliasesV1Key;
+extern NSString * const kSNPerAppNotificationFiltersV1Key;
+extern NSString * const kSNPerAppOnlySpeakMatchingFiltersV1Key;
+extern NSString * const kSNNotificationFilterActionDontSpeak;
+extern NSString * const kSNNotificationFilterActionSpeakNotification;
+extern NSString * const kSNNotificationFilterActionSpeakMatched;
+extern NSString * const kSNNotificationFilterActionSpeakCustom;
 
 typedef NS_ENUM(NSUInteger, SNA2DPDefaultTiming) {
     kSNA2DPDefaultWarmupMs = 200,

@@ -26,6 +26,12 @@ NSString * const kWiredAudioDevicesV2Key = @"trustedWiredAudioDevicesV2";
 NSString * const kAllowAnyWiredAudioDeviceKey = @"allowAnyWiredAudioDevice";
 NSString * const kWiredAudioDiagnosticKey = @"wiredAudioDiagnosticPending";
 NSString * const kTrustedConnectionAliasesV1Key = @"trustedConnectionAliasesV1";
+NSString * const kSNPerAppNotificationFiltersV1Key = @"perAppNotificationFiltersV1";
+NSString * const kSNPerAppOnlySpeakMatchingFiltersV1Key = @"perAppOnlySpeakMatchingFiltersV1";
+NSString * const kSNNotificationFilterActionDontSpeak = @"dontSpeak";
+NSString * const kSNNotificationFilterActionSpeakNotification = @"speakNotification";
+NSString * const kSNNotificationFilterActionSpeakMatched = @"speakMatched";
+NSString * const kSNNotificationFilterActionSpeakCustom = @"speakCustom";
 
 NSString *SNTrustedWiredAudioPortTypeLabel(NSString *portType)
 {
