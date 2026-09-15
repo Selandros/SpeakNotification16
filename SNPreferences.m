@@ -17,7 +17,6 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
 
 static NSString * const kKeyGlobalFormat         = @"globalFormat";
 static NSString * const kKeyMessageFormat        = @"messageFormat";
-static NSString * const kKeyQuietHoursEnabled    = @"enableQuietHours";
 static NSString * const kKeyQueueEnabled         = @"queueNotifications";
 static NSString * const kKeyLockscreenPrivacy    = @"lockscreenPrivacy";
 static NSString * const kKeyMuteSpam             = @"muteSpam";
@@ -236,7 +235,7 @@ static void prefsChangedCallback(CFNotificationCenterRef center,
         fmt = @"{APP}: {TITLE}: {BODY}";
     }
 
-    NSNumber *qHours  = [defs objectForKey:kKeyQuietHoursEnabled];
+    NSNumber *qHours  = [defs objectForKey:kSNQuietHoursEnabledKey];
     NSNumber *queue   = [defs objectForKey:kKeyQueueEnabled];
     NSNumber *lsPriv  = [defs objectForKey:kKeyLockscreenPrivacy];
 

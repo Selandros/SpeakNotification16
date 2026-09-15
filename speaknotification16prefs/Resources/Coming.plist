@@ -22,41 +22,6 @@
 
         <dict>
             <key>cell</key><string>PSGroupCell</string>
-            <key>label</key><string>Quiet Hours</string>
-            <key>footerText</key>
-            <string>Planned quiet-hours schedule. Disabled for now.</string>
-        </dict>
-        <dict>
-            <key>cell</key><string>PSSwitchCell</string>
-            <key>label</key><string>Enable quiet hours</string>
-            <key>defaults</key><string>com.selandros.speaknotification16</string>
-            <key>key</key><string>enableQuietHours</string>
-            <key>default</key><false/>
-            <key>enabled</key><false/>
-        </dict>
-        <dict>
-            <key>cell</key><string>PSEditTextCell</string>
-            <key>label</key><string>Start time</string>
-            <key>defaults</key><string>com.selandros.speaknotification16</string>
-            <key>key</key><string>quietStart</string>
-            <key>placeholder</key><string>22:00</string>
-            <key>noAutoCorrect</key><true/>
-            <key>noAutoCaps</key><true/>
-            <key>enabled</key><false/>
-        </dict>
-        <dict>
-            <key>cell</key><string>PSEditTextCell</string>
-            <key>label</key><string>End time</string>
-            <key>defaults</key><string>com.selandros.speaknotification16</string>
-            <key>key</key><string>quietEnd</string>
-            <key>placeholder</key><string>07:00</string>
-            <key>noAutoCorrect</key><true/>
-            <key>noAutoCaps</key><true/>
-            <key>enabled</key><false/>
-        </dict>
-
-        <dict>
-            <key>cell</key><string>PSGroupCell</string>
             <key>label</key><string>Lock Screen Privacy</string>
             <key>footerText</key>
             <string>Planned lock-screen privacy mode. Disabled for now.</string>

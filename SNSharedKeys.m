@@ -28,10 +28,33 @@ NSString * const kWiredAudioDiagnosticKey = @"wiredAudioDiagnosticPending";
 NSString * const kTrustedConnectionAliasesV1Key = @"trustedConnectionAliasesV1";
 NSString * const kSNPerAppNotificationFiltersV1Key = @"perAppNotificationFiltersV1";
 NSString * const kSNPerAppOnlySpeakMatchingFiltersV1Key = @"perAppOnlySpeakMatchingFiltersV1";
+NSString * const kSNQuietHoursEnabledKey = @"quietHoursEnabled";
+NSString * const kSNQuietHoursStartMinutesKey = @"quietHoursStartMinutes";
+NSString * const kSNQuietHoursEndMinutesKey = @"quietHoursEndMinutes";
+NSString * const kSNFilterScheduleEnabledKey = @"scheduleEnabled";
+NSString * const kSNFilterScheduleStartMinutesKey = @"scheduleStartMinutes";
+NSString * const kSNFilterScheduleEndMinutesKey = @"scheduleEndMinutes";
+NSString * const kSNFilterActiveDuringQuietHoursKey = @"activeDuringQuietHours";
 NSString * const kSNNotificationFilterActionDontSpeak = @"dontSpeak";
 NSString * const kSNNotificationFilterActionSpeakNotification = @"speakNotification";
 NSString * const kSNNotificationFilterActionSpeakMatched = @"speakMatched";
 NSString * const kSNNotificationFilterActionSpeakCustom = @"speakCustom";
+NSString * const kSNNotificationFilterActionRemoveMatched = @"removeMatched";
+
+NSInteger SNCurrentLocalMinuteOfDay(void)
+{
+    NSDateComponents *components = [[NSCalendar currentCalendar] components:(NSCalendarUnitHour | NSCalendarUnitMinute)
+                                                                    fromDate:[NSDate date]];
+    return components.hour * 60 + components.minute;
+}
+
+BOOL SNIsMinuteInDailyInterval(NSInteger startMinute, NSInteger endMinute, NSInteger currentMinute)
+{
+    if (startMinute < 0 || startMinute >= 1440 || endMinute < 0 || endMinute >= 1440 ||
+        currentMinute < 0 || currentMinute >= 1440 || startMinute == endMinute) return NO;
+    if (startMinute < endMinute) return currentMinute >= startMinute && currentMinute < endMinute;
+    return currentMinute >= startMinute || currentMinute < endMinute;
+}
 
 NSString *SNTrustedWiredAudioPortTypeLabel(NSString *portType)
 {

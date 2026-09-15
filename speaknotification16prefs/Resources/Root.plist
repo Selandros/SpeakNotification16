@@ -73,6 +73,36 @@
             <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
         </dict>
 
+        <!-- QUIET HOURS -->
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>QUIET HOURS</string>
+            <key>footerText</key>
+            <string>Notification speech is blocked during Quiet Hours unless a matching filter is allowed to remain active. From is inclusive and To is exclusive; equal times disable the interval.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>Enable Quiet Hours</string>
+            <key>defaults</key><string>com.selandros.speaknotification16</string>
+            <key>key</key><string>quietHoursEnabled</string>
+            <key>default</key><false/>
+            <key>PostNotification</key><string>com.selandros.speaknotification16/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSLinkCell</string>
+            <key>label</key><string>From</string>
+            <key>id</key><string>quiet_hours_start</string>
+            <key>minuteKey</key><string>quietHoursStartMinutes</string>
+            <key>detail</key><string>SNMinuteOfDayController</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSLinkCell</string>
+            <key>label</key><string>To</string>
+            <key>id</key><string>quiet_hours_end</string>
+            <key>minuteKey</key><string>quietHoursEndMinutes</string>
+            <key>detail</key><string>SNMinuteOfDayController</string>
+        </dict>
+
         <!-- BLOCK SPEAK ON MUTE -->
         <dict>
             <key>cell</key><string>PSGroupCell</string>

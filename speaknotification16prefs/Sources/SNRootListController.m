@@ -10,6 +10,7 @@
 #import "SNPrefsUtil.h"
 #import "SNPreferences.h"
 #import "SNBluetoothTuningController.h"
+#import "SNSharedKeys.h"
 
 static NSString * const kSNLogPath = @"/var/mobile/Library/Logs/log_speaknotification16.txt";
 static NSString * const kReadIncomingKey = @"readIncomingCalls";
@@ -782,6 +783,12 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
     if (_specifiers) return _specifiers;
 
     _specifiers = [[self loadSpecifiersFromPlistName:@"Root" target:self] mutableCopy];
+    for (PSSpecifier *specifier in _specifiers) {
+        NSString *identifier = [specifier propertyForKey:@"id"];
+        if ([identifier isEqualToString:@"quiet_hours_start"] || [identifier isEqualToString:@"quiet_hours_end"]) {
+            [specifier setProperty:[SNMinuteOfDayValueCell class] forKey:@"cellClass"];
+        }
+    }
     [self sn_configureStepperSpecifiers];
 
     NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
@@ -846,6 +853,33 @@ static void SNReleasePrefsChanged(__unused CFNotificationCenterRef center,
 
     self.navigationItem.title = @"SpeakNotification16";
     return _specifiers;
+}
+
+- (NSInteger)minuteValueForKey:(NSString *)key
+{
+    NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+    id raw = [defs objectForKey:key];
+    NSInteger fallback = [key isEqualToString:kSNQuietHoursStartMinutesKey]
+        ? kSNQuietHoursDefaultStartMinutes : kSNQuietHoursDefaultEndMinutes;
+    if (![raw isKindOfClass:NSNumber.class]) return fallback;
+    NSInteger value = [raw integerValue];
+    return [raw doubleValue] == value && value >= 0 && value < 1440 ? value : fallback;
+}
+
+- (NSString *)minuteTitleForKey:(NSString *)key
+{
+    NSInteger minute = [self minuteValueForKey:key];
+    return [NSString stringWithFormat:@"%02ld:%02ld", (long)(minute / 60), (long)(minute % 60)];
+}
+
+- (void)setMinuteValue:(NSInteger)value forKey:(NSString *)key
+{
+    if (value < 0 || value >= 1440 ||
+        (![key isEqualToString:kSNQuietHoursStartMinutesKey] && ![key isEqualToString:kSNQuietHoursEndMinutesKey])) return;
+    NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite];
+    [defs setInteger:value forKey:key];
+    [defs synchronize];
+    [SNPrefsUtil postPrefsChanged];
 }
 
 - (void)viewDidLoad {
@@ -2161,10 +2195,10 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
             @"muteSpam": @NO,
             @"spamCooldownSeconds": @12,
 
-            // Quiet hours
-            @"enableQuietHours": @NO,
-            @"quietStart": @"",
-            @"quietEnd": @"",
+            // Quiet Hours
+            kSNQuietHoursEnabledKey: @NO,
+            kSNQuietHoursStartMinutesKey: @(kSNQuietHoursDefaultStartMinutes),
+            kSNQuietHoursEndMinutesKey: @(kSNQuietHoursDefaultEndMinutes),
 
             // Lock screen privacy
             @"lockscreenPrivacy": @NO,

@@ -27,10 +27,25 @@ extern NSString * const kWiredAudioDiagnosticKey;
 extern NSString * const kTrustedConnectionAliasesV1Key;
 extern NSString * const kSNPerAppNotificationFiltersV1Key;
 extern NSString * const kSNPerAppOnlySpeakMatchingFiltersV1Key;
+extern NSString * const kSNQuietHoursEnabledKey;
+extern NSString * const kSNQuietHoursStartMinutesKey;
+extern NSString * const kSNQuietHoursEndMinutesKey;
+extern NSString * const kSNFilterScheduleEnabledKey;
+extern NSString * const kSNFilterScheduleStartMinutesKey;
+extern NSString * const kSNFilterScheduleEndMinutesKey;
+extern NSString * const kSNFilterActiveDuringQuietHoursKey;
 extern NSString * const kSNNotificationFilterActionDontSpeak;
 extern NSString * const kSNNotificationFilterActionSpeakNotification;
 extern NSString * const kSNNotificationFilterActionSpeakMatched;
 extern NSString * const kSNNotificationFilterActionSpeakCustom;
+extern NSString * const kSNNotificationFilterActionRemoveMatched;
+
+typedef NS_ENUM(NSInteger, SNSharedMinuteDefaults) {
+    kSNQuietHoursDefaultStartMinutes = 1320,
+    kSNQuietHoursDefaultEndMinutes = 420,
+    kSNFilterScheduleDefaultStartMinutes = 480,
+    kSNFilterScheduleDefaultEndMinutes = 1020,
+};
 
 typedef NS_ENUM(NSUInteger, SNA2DPDefaultTiming) {
     kSNA2DPDefaultWarmupMs = 200,
@@ -48,6 +63,8 @@ BOOL SNIsUsableWiredAudioUID(NSString *uid);
 NSString *SNCanonicalWiredAudioUID(NSString *portType, NSString *rawUID);
 BOOL SNIsUsableBluetoothDeviceUID(NSString *uid);
 NSString *SNCanonicalBluetoothDeviceUID(NSString *rawUID);
+NSInteger SNCurrentLocalMinuteOfDay(void);
+BOOL SNIsMinuteInDailyInterval(NSInteger startMinute, NSInteger endMinute, NSInteger currentMinute);
 
 #ifdef __cplusplus
 }

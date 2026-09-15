@@ -1674,14 +1674,14 @@ static BOOL sn_audit_write_notif(NSDictionary *s, NSString *txnText)
            s[@"voiceIdentifier"] ?: @"-",
            s[@"voiceSource"] ?: @"-",
            s[@"voiceQuality"] ?: @"-"];
-    SNLOGFMT(@"[NOTIF] %02llu | txn=%@ sectionID=%@ title_len=%@ subtitle_len=%@ body_len=%@ | wifi=%@ bt=%@ wired=%@ broadWired=%@ trust=%@ trustedBy=%@ callGate=%@ | route=%@ otherAudio=%@ volume=%@%% muted=%@ locked=%@ fg=%@ screen=%@ battery=%@ | sound=%@ fmt=%@ | lang=%@ %@ | policy=%@ queue=%@ filter=%@ action=%@ result=%@ voice=%@",
+    SNLOGFMT(@"[NOTIF] %02llu | txn=%@ sectionID=%@ title_len=%@ subtitle_len=%@ body_len=%@ | wifi=%@ bt=%@ wired=%@ broadWired=%@ trust=%@ trustedBy=%@ callGate=%@ | route=%@ otherAudio=%@ volume=%@%% muted=%@ locked=%@ fg=%@ screen=%@ battery=%@ | sound=%@ fmt=%@ | lang=%@ %@ | policy=%@ quietHours=%@ queue=%@ filter=%@ action=%@ result=%@ voice=%@",
              [s[@"seq"] unsignedLongLongValue], txnText ?: @"-",
              s[@"sectionID"] ?: @"-", s[@"titleLen"] ?: @0, s[@"subtitleLen"] ?: @0, s[@"bodyLen"] ?: @0,
              s[@"wifi"] ?: @"-", s[@"bluetooth"] ?: @"-", s[@"wired"] ?: @"-", s[@"broadWired"] ?: @"-",
              s[@"trust"] ?: @"-", s[@"trustedBy"] ?: @"-", s[@"callGate"] ?: @"-",
              s[@"route"] ?: @"-", s[@"otherAudio"] ?: @"-", s[@"volume"] ?: @"-", s[@"muted"] ?: @"-", s[@"locked"] ?: @"-",
              s[@"foreground"] ?: @"-", s[@"screen"] ?: @"-", s[@"battery"] ?: @"-", s[@"sound"] ?: @"-",
-             s[@"format"] ?: @"-", s[@"lang"] ?: @"-", languageText, s[@"policy"] ?: @"-", s[@"queue"] ?: @"-",
+             s[@"format"] ?: @"-", s[@"lang"] ?: @"-", languageText, s[@"policy"] ?: @"-", s[@"quietHours"] ?: @"notEvaluated", s[@"queue"] ?: @"-",
              s[@"filter"] ?: @"none", s[@"action"] ?: @"-", s[@"result"] ?: @"-",
              voiceText);
     return YES;
@@ -1822,14 +1822,25 @@ static inline NSString *sn_normalized_app_counter_key(NSString *bundleID);
 static NSDictionary *sn_evaluate_notification_filter(NSString *bundleID,
                                                        NSString *title,
                                                        NSString *subtitle,
-                                                       NSString *body)
+                                                       NSString *body,
+                                                       NSInteger localMinute)
 {
     NSString *key = sn_normalized_app_counter_key(bundleID);
-    if (key.length == 0) return @{ @"kind": @"none" };
     NSUserDefaults *defs = [[[NSUserDefaults alloc] initWithSuiteName:kSNPrefsSuite] autorelease];
     NSDictionary *all = [defs objectForKey:kSNPerAppNotificationFiltersV1Key];
-    NSArray *raw = [all isKindOfClass:NSDictionary.class] ? all[key] : nil;
-    if (![raw isKindOfClass:NSArray.class] || raw.count == 0) return @{ @"kind": @"none" };
+    NSArray *raw = ([all isKindOfClass:NSDictionary.class] && key.length) ? all[key] : nil;
+
+    id rawQuietEnabled = [defs objectForKey:kSNQuietHoursEnabledKey];
+    BOOL quietEnabled = [rawQuietEnabled isKindOfClass:NSNumber.class] && [rawQuietEnabled boolValue];
+    id rawQuietStart = [defs objectForKey:kSNQuietHoursStartMinutesKey];
+    id rawQuietEnd = [defs objectForKey:kSNQuietHoursEndMinutesKey];
+    NSInteger quietStart = kSNQuietHoursDefaultStartMinutes;
+    NSInteger quietEnd = kSNQuietHoursDefaultEndMinutes;
+    if ([rawQuietStart isKindOfClass:NSNumber.class] && [rawQuietStart doubleValue] == [rawQuietStart integerValue]) quietStart = [rawQuietStart integerValue];
+    else if (rawQuietStart) quietEnabled = NO;
+    if ([rawQuietEnd isKindOfClass:NSNumber.class] && [rawQuietEnd doubleValue] == [rawQuietEnd integerValue]) quietEnd = [rawQuietEnd integerValue];
+    else if (rawQuietEnd) quietEnabled = NO;
+    BOOL quietActive = quietEnabled && SNIsMinuteInDailyInterval(quietStart, quietEnd, localMinute);
 
     NSString *searchable = [NSString stringWithFormat:@"%@\n%@\n%@",
                             [title isKindOfClass:NSString.class] ? title : @"",
@@ -1847,36 +1858,130 @@ static NSDictionary *sn_evaluate_notification_filter(NSString *bundleID,
         if (![action isEqualToString:kSNNotificationFilterActionDontSpeak] &&
             ![action isEqualToString:kSNNotificationFilterActionSpeakNotification] &&
             ![action isEqualToString:kSNNotificationFilterActionSpeakMatched] &&
-            ![action isEqualToString:kSNNotificationFilterActionSpeakCustom]) continue;
+            ![action isEqualToString:kSNNotificationFilterActionSpeakCustom] &&
+            ![action isEqualToString:kSNNotificationFilterActionRemoveMatched]) continue;
         NSString *custom = [value[@"customText"] isKindOfClass:NSString.class]
             ? [value[@"customText"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
         if ([action isEqualToString:kSNNotificationFilterActionSpeakCustom] && custom.length == 0) continue;
+        id scheduleEnabledValue = value[kSNFilterScheduleEnabledKey];
+        if (scheduleEnabledValue && ![scheduleEnabledValue isKindOfClass:NSNumber.class]) continue;
+        BOOL scheduleEnabled = [scheduleEnabledValue boolValue];
+        id activeDuringQuietHoursValue = value[kSNFilterActiveDuringQuietHoursKey];
+        if (activeDuringQuietHoursValue && ![activeDuringQuietHoursValue isKindOfClass:NSNumber.class]) continue;
+        BOOL activeDuringQuietHours = [activeDuringQuietHoursValue boolValue];
+        NSInteger scheduleStart = kSNFilterScheduleDefaultStartMinutes;
+        NSInteger scheduleEnd = kSNFilterScheduleDefaultEndMinutes;
+        if (scheduleEnabled) {
+            id startValue = value[kSNFilterScheduleStartMinutesKey];
+            id endValue = value[kSNFilterScheduleEndMinutesKey];
+            if ((startValue && ![startValue isKindOfClass:NSNumber.class]) ||
+                (endValue && ![endValue isKindOfClass:NSNumber.class])) continue;
+            if ((startValue && [startValue doubleValue] != [startValue integerValue]) ||
+                (endValue && [endValue doubleValue] != [endValue integerValue])) continue;
+            scheduleStart = startValue ? [startValue integerValue] : kSNFilterScheduleDefaultStartMinutes;
+            scheduleEnd = endValue ? [endValue integerValue] : kSNFilterScheduleDefaultEndMinutes;
+            if (scheduleStart < 0 || scheduleStart >= 1440 || scheduleEnd < 0 || scheduleEnd >= 1440) continue;
+        }
         validRuleCount++;
+        if (quietActive && !activeDuringQuietHours) continue;
+        if (scheduleEnabled && !SNIsMinuteInDailyInterval(scheduleStart, scheduleEnd, localMinute)) continue;
         if ([searchable rangeOfString:match options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
-        [matches addObject:@{ @"action": action, @"match": match, @"custom": custom }];
+        [matches addObject:@{ @"action": action, @"match": match, @"custom": custom,
+                              @"activeDuringQuietHours": @(activeDuringQuietHours) }];
     }
     for (NSDictionary *match in matches) {
         if ([match[@"action"] isEqualToString:kSNNotificationFilterActionDontSpeak]) {
-            return @{ @"kind": @"deny", @"audit": @"denyMatched" };
+            return @{ @"kind": @"deny", @"audit": @"denyMatched", @"reason": @"filterDenied",
+                      @"quietHours": quietActive ? @"active" : @"inactive" };
         }
     }
     if (matches.count) {
         NSDictionary *match = matches.firstObject;
         NSString *action = match[@"action"];
         if ([action isEqualToString:kSNNotificationFilterActionSpeakNotification]) {
-            return @{ @"kind": @"speak", @"action": action, @"audit": @"allowMatched" };
+            return @{ @"kind": @"speak", @"action": action, @"audit": @"allowMatched",
+                      @"quietHours": quietActive ? @"bypassedByFilter" : @"inactive" };
+        }
+        if ([action isEqualToString:kSNNotificationFilterActionRemoveMatched]) {
+            return @{ @"kind": @"transform", @"action": action, @"match": match[@"match"],
+                      @"audit": @"allowMatched", @"quietHours": quietActive ? @"bypassedByFilter" : @"inactive" };
         }
         NSString *text = [action isEqualToString:kSNNotificationFilterActionSpeakCustom]
             ? match[@"custom"] : match[@"match"];
         return @{ @"kind": @"speak", @"action": action, @"text": text,
-                  @"audit": [action isEqualToString:kSNNotificationFilterActionSpeakCustom] ? @"speakCustom" : @"speakMatched" };
+                  @"audit": [action isEqualToString:kSNNotificationFilterActionSpeakCustom] ? @"speakCustom" : @"speakMatched",
+                  @"quietHours": quietActive ? @"bypassedByFilter" : @"inactive" };
     }
+    if (quietActive) return @{ @"kind": @"deny", @"audit": @"quietHoursActive", @"reason": @"quietHours",
+                               @"quietHours": @"active" };
     NSDictionary *onlyAll = [defs objectForKey:kSNPerAppOnlySpeakMatchingFiltersV1Key];
-    BOOL onlyMatching = [onlyAll isKindOfClass:NSDictionary.class] && [onlyAll[key] boolValue];
+    BOOL onlyMatching = key.length && [onlyAll isKindOfClass:NSDictionary.class] && [onlyAll[key] boolValue];
     if (onlyMatching && validRuleCount > 0) {
-        return @{ @"kind": @"deny", @"audit": @"denyUnmatched" };
+        return @{ @"kind": @"deny", @"audit": @"denyUnmatched",
+                  @"reason": @"filterDenied", @"quietHours": @"inactive" };
     }
-    return @{ @"kind": @"none" };
+    return @{ @"kind": @"none", @"quietHours": @"inactive" };
+}
+
+static BOOL sn_filter_separator_character(unichar character)
+{
+    return character == '-' || character == 0x2013 || character == 0x2014 || character == '|' || character == 0x2022;
+}
+
+static NSString *sn_remove_filter_phrase_from_field(NSString *field, NSString *phrase)
+{
+    if (![field isKindOfClass:NSString.class] || phrase.length == 0) return field ?: @"";
+    NSMutableArray<NSValue *> *ranges = [NSMutableArray array];
+    NSRange searchRange = NSMakeRange(0, field.length);
+    while (searchRange.length > 0) {
+        NSRange matchRange = [field rangeOfString:phrase options:NSCaseInsensitiveSearch range:searchRange];
+        if (matchRange.location == NSNotFound) break;
+        [ranges addObject:[NSValue valueWithRange:matchRange]];
+        NSUInteger next = NSMaxRange(matchRange);
+        if (next >= field.length) break;
+        searchRange = NSMakeRange(next, field.length - next);
+    }
+
+    NSMutableString *working = [field mutableCopy];
+    NSCharacterSet *whitespace = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    for (NSValue *boxedRange in ranges.reverseObjectEnumerator) {
+        NSRange range = boxedRange.rangeValue;
+        if (NSMaxRange(range) > working.length) continue;
+        NSUInteger start = range.location;
+        NSUInteger end = NSMaxRange(range);
+        NSString *prefix = [working substringToIndex:start];
+        NSString *suffix = [working substringFromIndex:end];
+        if ([[prefix stringByTrimmingCharactersInSet:whitespace] length] == 0) {
+            NSUInteger cursor = end;
+            BOOL foundSeparator = NO;
+            while (cursor < working.length) {
+                unichar c = [working characterAtIndex:cursor];
+                if ([whitespace characterIsMember:c]) { cursor++; continue; }
+                if (sn_filter_separator_character(c)) { foundSeparator = YES; cursor++; continue; }
+                break;
+            }
+            if (foundSeparator) end = cursor;
+        }
+        if ([[suffix stringByTrimmingCharactersInSet:whitespace] length] == 0) {
+            NSUInteger cursor = start;
+            BOOL foundSeparator = NO;
+            while (cursor > 0) {
+                unichar c = [working characterAtIndex:cursor - 1];
+                if ([whitespace characterIsMember:c]) { cursor--; continue; }
+                if (sn_filter_separator_character(c)) { foundSeparator = YES; cursor--; continue; }
+                break;
+            }
+            if (foundSeparator) start = cursor;
+        }
+        [working replaceCharactersInRange:NSMakeRange(start, end - start) withString:@" "];
+    }
+
+    NSArray<NSString *> *parts = [[working stringByTrimmingCharactersInSet:whitespace] componentsSeparatedByCharactersInSet:whitespace];
+    NSMutableArray<NSString *> *nonEmpty = [NSMutableArray arrayWithCapacity:parts.count];
+    for (NSString *part in parts) if (part.length) [nonEmpty addObject:part];
+    NSString *result = [nonEmpty componentsJoinedByString:@" "];
+    [working release];
+    return result;
 }
 static void SN_CancelAll(const char *source);
 static inline BOOL sn_cancel_buttons_armed_now(void);
@@ -5804,7 +5909,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.6";
+static NSString * const kReleaseInstalledVersion = @"2.1.7";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
@@ -7995,28 +8100,46 @@ static uint64_t SN_Seq = 0;
                     }
                 }
 
-                filterDecision = sn_evaluate_notification_filter(sectionID, title, subtitle, body);
+                NSInteger notificationMinute = SNCurrentLocalMinuteOfDay();
+                filterDecision = sn_evaluate_notification_filter(sectionID, title, subtitle, body, notificationMinute);
+                NSMutableDictionary *filterAudit = [auditIngress mutableCopy] ?: [[NSMutableDictionary alloc] init];
+                filterAudit[@"quietHours"] = filterDecision[@"quietHours"] ?: @"inactive";
+                if (filterDecision[@"audit"]) filterAudit[@"filter"] = filterDecision[@"audit"];
+                auditIngress = [filterAudit autorelease];
                 if ([filterDecision[@"kind"] isEqualToString:@"deny"]) {
-                    NSMutableDictionary *filterAudit = [auditIngress mutableCopy];
-                    filterAudit[@"filter"] = filterDecision[@"audit"] ?: @"denyMatched";
-                    auditIngress = [filterAudit autorelease];
                     allowTTS = NO;
-                    sn_audit_emit_denied(auditIngress, @"filterDenied");
+                    sn_audit_emit_denied(auditIngress, filterDecision[@"reason"] ?: @"filterDenied");
                     didOrig = YES;
                     %orig(bulletin, destinations);
                     return;
+                }
+                if ([filterDecision[@"kind"] isEqualToString:@"transform"] &&
+                    [filterDecision[@"action"] isEqualToString:kSNNotificationFilterActionRemoveMatched]) {
+                    NSString *phrase = filterDecision[@"match"];
+                    title = sn_remove_filter_phrase_from_field(title, phrase);
+                    subtitle = sn_remove_filter_phrase_from_field(subtitle, phrase);
+                    body = sn_remove_filter_phrase_from_field(body, phrase);
+                    bodySan = [SNStringUtils sanitizeForTTS:(body ?: @"")];
+                    normTitleOnce = [SNStringUtils normalizedTitle:(title ?: @"")];
+                    titleSan = normTitleOnce ?: @"";
+                    BOOL hasSpeechText = titleSan.length > 0 ||
+                        [SNStringUtils sanitizeForTTS:(subtitle ?: @"")].length > 0 || bodySan.length > 0;
+                    if (!hasSpeechText) {
+                        NSMutableDictionary *emptyAudit = [auditIngress mutableCopy];
+                        emptyAudit[@"filter"] = @"removeMatchedEmpty";
+                        auditIngress = [emptyAudit autorelease];
+                        allowTTS = NO;
+                        sn_audit_emit_denied(auditIngress, @"removeMatchedEmpty");
+                        didOrig = YES;
+                        %orig(bulletin, destinations);
+                        return;
+                    }
                 }
 
             }
 
             NSString *auditSound = @"notAttempted";
             NSDictionary *auditPlan = nil;
-
-            // All synchronous speech eligibility checks have passed.
-            if (allowTTS) {
-                SN_TTS_InitOnce();
-                auditSound = sn_try_suppress_notification_sound(bulletin, sectionID, publisherID, bulletinID);
-            }
 
             // Build message and choose language
             NSString *formatStr = nil, *msg = nil, *bcp47 = nil;
@@ -8050,8 +8173,22 @@ static uint64_t SN_Seq = 0;
                 NSString *filterText = filterDecision[@"text"];
                 msg = filterText.length ? [SNStringUtils sanitizeForTTS:filterText]
                                          : [SNStringUtils sanitizeForTTS:msg];
+                NSString *removedPhrase = [filterDecision[@"action"] isEqualToString:kSNNotificationFilterActionRemoveMatched]
+                    ? filterDecision[@"match"] : nil;
+                if (removedPhrase.length) {
+                    msg = [SNStringUtils sanitizeForTTS:sn_remove_filter_phrase_from_field(msg, removedPhrase)];
+                }
+                if (msg.length > 0) {
+                    // Suppress the original sound only after a valid spoken message has been prepared.
+                    SN_TTS_InitOnce();
+                    auditSound = sn_try_suppress_notification_sound(bulletin, sectionID, publisherID, bulletinID);
+                }
                 NSString *languageSource = filterText.length ? @"filter" : (bodySan.length ? @"body" : (title.length ? @"title" : @"subtitle"));
                 NSString *languageSourceText = filterText.length ? filterText : (bodySan.length ? bodySan : (title.length ? title : subtitle ?: @""));
+                if (removedPhrase.length) {
+                    languageSource = @"formatted";
+                    languageSourceText = msg;
+                }
                 NSString *detectedLanguage = nil;
                 NSString *languageReason = nil;
                 NSString *languageDiagnostic = nil;
@@ -8069,7 +8206,8 @@ static uint64_t SN_Seq = 0;
                 auditMutable[@"lang"] = bcp47 ?: @"-";
                 auditMutable[@"langReason"] = languageReason ?: @"-";
                 auditMutable[@"langDiagnostic"] = languageDiagnostic ?: @"-";
-                auditMutable[@"filter"] = [filterDecision[@"kind"] isEqualToString:@"speak"]
+                auditMutable[@"filter"] = ([filterDecision[@"kind"] isEqualToString:@"speak"] ||
+                                             [filterDecision[@"kind"] isEqualToString:@"transform"])
                     ? [NSString stringWithFormat:@"allowMatched action=%@", filterDecision[@"action"] ?: @"-"] : @"none";
                 auditMutable[@"callGate"] = @"allow";
                 auditPlan = [auditMutable autorelease];

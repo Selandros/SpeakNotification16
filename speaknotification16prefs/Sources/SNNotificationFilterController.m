@@ -5,6 +5,7 @@
 #import "SNNotificationFilterController.h"
 #import "SNPrefsUtil.h"
 #import "SNSharedKeys.h"
+#import "SNMinuteOfDayController.h"
 
 static NSString *SNFilterTrim(id value)
 {
@@ -21,13 +22,38 @@ static NSDictionary *SNValidFilter(id value)
     if (![action isEqualToString:kSNNotificationFilterActionDontSpeak] &&
         ![action isEqualToString:kSNNotificationFilterActionSpeakNotification] &&
         ![action isEqualToString:kSNNotificationFilterActionSpeakMatched] &&
-        ![action isEqualToString:kSNNotificationFilterActionSpeakCustom]) return nil;
+        ![action isEqualToString:kSNNotificationFilterActionSpeakCustom] &&
+        ![action isEqualToString:kSNNotificationFilterActionRemoveMatched]) return nil;
     NSMutableDictionary *rule = [@{ @"match": match, @"action": action } mutableCopy];
     if ([action isEqualToString:kSNNotificationFilterActionSpeakCustom]) {
         NSString *custom = SNFilterTrim(value[@"customText"]);
         if (custom.length == 0) return nil;
         rule[@"customText"] = custom;
     }
+    id scheduleEnabled = value[kSNFilterScheduleEnabledKey];
+    if (scheduleEnabled && ![scheduleEnabled isKindOfClass:NSNumber.class]) return nil;
+    BOOL usesSchedule = [scheduleEnabled boolValue];
+    id scheduleStart = value[kSNFilterScheduleStartMinutesKey];
+    id scheduleEnd = value[kSNFilterScheduleEndMinutesKey];
+    if (usesSchedule && ((scheduleStart && ![scheduleStart isKindOfClass:NSNumber.class]) ||
+                         (scheduleEnd && ![scheduleEnd isKindOfClass:NSNumber.class]))) return nil;
+    NSInteger start = scheduleStart && [scheduleStart isKindOfClass:NSNumber.class]
+        ? [scheduleStart integerValue] : kSNFilterScheduleDefaultStartMinutes;
+    NSInteger end = scheduleEnd && [scheduleEnd isKindOfClass:NSNumber.class]
+        ? [scheduleEnd integerValue] : kSNFilterScheduleDefaultEndMinutes;
+    if (usesSchedule && ((scheduleStart && [scheduleStart isKindOfClass:NSNumber.class] && [scheduleStart doubleValue] != [scheduleStart integerValue]) ||
+                         (scheduleEnd && [scheduleEnd isKindOfClass:NSNumber.class] && [scheduleEnd doubleValue] != [scheduleEnd integerValue]) ||
+                         start < 0 || start >= 1440 || end < 0 || end >= 1440)) return nil;
+    if (!usesSchedule) {
+        if (start < 0 || start >= 1440) start = kSNFilterScheduleDefaultStartMinutes;
+        if (end < 0 || end >= 1440) end = kSNFilterScheduleDefaultEndMinutes;
+    }
+    id quietParticipation = value[kSNFilterActiveDuringQuietHoursKey];
+    if (quietParticipation && ![quietParticipation isKindOfClass:NSNumber.class]) return nil;
+    rule[kSNFilterScheduleEnabledKey] = @(usesSchedule);
+    rule[kSNFilterScheduleStartMinutesKey] = @(start);
+    rule[kSNFilterScheduleEndMinutesKey] = @(end);
+    rule[kSNFilterActiveDuringQuietHoursKey] = @([quietParticipation boolValue]);
     return rule;
 }
 
@@ -88,6 +114,7 @@ static NSString *SNFilterActionTitle(NSString *action)
     if ([action isEqualToString:kSNNotificationFilterActionDontSpeak]) return @"Don't Speak";
     if ([action isEqualToString:kSNNotificationFilterActionSpeakNotification]) return @"Speak Notification";
     if ([action isEqualToString:kSNNotificationFilterActionSpeakCustom]) return @"Speak Custom Text";
+    if ([action isEqualToString:kSNNotificationFilterActionRemoveMatched]) return @"Remove Matched Text";
     return @"Speak Matched Phrase";
 }
 
@@ -97,6 +124,7 @@ static NSString *SNFilterActionHelp(NSString *action)
     if ([action isEqualToString:kSNNotificationFilterActionSpeakNotification]) return @"Speak the matching notification normally using this app's existing message format.";
     if ([action isEqualToString:kSNNotificationFilterActionSpeakMatched]) return @"Speak only the phrase entered in Contains.";
     if ([action isEqualToString:kSNNotificationFilterActionSpeakCustom]) return @"Speak your own text instead of the notification.";
+    if ([action isEqualToString:kSNNotificationFilterActionRemoveMatched]) return @"Removes the Contains phrase, then reads the rest of the notification normally.";
     return @"";
 }
 
@@ -106,6 +134,7 @@ static NSString *SNFilterActionSelectorHelp(NSString *action)
     if ([action isEqualToString:kSNNotificationFilterActionSpeakNotification]) return @"Reads the full matching notification using this app's existing message format.";
     if ([action isEqualToString:kSNNotificationFilterActionSpeakMatched]) return @"Reads only the text entered in Contains.";
     if ([action isEqualToString:kSNNotificationFilterActionSpeakCustom]) return @"Reads your own text instead of the notification.";
+    if ([action isEqualToString:kSNNotificationFilterActionRemoveMatched]) return @"Removes the Contains phrase, then reads the rest of the notification normally.";
     return @"";
 }
 
@@ -258,7 +287,8 @@ static UITextField *SNFilterTextFieldInView(UIView *view)
     NSArray *values = @[kSNNotificationFilterActionDontSpeak,
                         kSNNotificationFilterActionSpeakNotification,
                         kSNNotificationFilterActionSpeakMatched,
-                        kSNNotificationFilterActionSpeakCustom];
+                        kSNNotificationFilterActionSpeakCustom,
+                        kSNNotificationFilterActionRemoveMatched];
     for (NSUInteger index = 0; index < values.count; index++) {
         NSString *value = values[index];
         PSSpecifier *group = [PSSpecifier preferenceSpecifierNamed:(index == 0 ? @"ACTION" : @"") target:self set:NULL get:NULL detail:nil cell:PSGroupCell edit:nil];
@@ -304,6 +334,11 @@ static UITextField *SNFilterTextFieldInView(UIView *view)
 @property (nonatomic, copy) NSString *matchDraft;
 @property (nonatomic, copy) NSString *customDraft;
 @property (nonatomic, copy) NSString *actionDraft;
+@property (nonatomic, assign) BOOL scheduleEnabledDraft;
+@property (nonatomic, assign) NSInteger scheduleStartDraft;
+@property (nonatomic, assign) NSInteger scheduleEndDraft;
+@property (nonatomic, assign) BOOL activeDuringQuietHoursDraft;
+@property (nonatomic, assign) BOOL scheduleDraftInitialized;
 @property (nonatomic, assign) NSUInteger filterIndex;
 @property (nonatomic, assign) BOOL newFilter;
 @end
@@ -327,6 +362,15 @@ static UITextField *SNFilterTextFieldInView(UIView *view)
     if (!self.matchDraft) self.matchDraft = rule[@"match"] ?: @"";
     if (!self.actionDraft) self.actionDraft = rule[@"action"] ?: kSNNotificationFilterActionDontSpeak;
     if (!self.customDraft) self.customDraft = rule[@"customText"] ?: @"";
+    if (!self.scheduleDraftInitialized) {
+        self.scheduleDraftInitialized = YES;
+        self.scheduleEnabledDraft = [rule[kSNFilterScheduleEnabledKey] boolValue];
+        self.scheduleStartDraft = [rule[kSNFilterScheduleStartMinutesKey] respondsToSelector:@selector(integerValue)]
+            ? [rule[kSNFilterScheduleStartMinutesKey] integerValue] : kSNFilterScheduleDefaultStartMinutes;
+        self.scheduleEndDraft = [rule[kSNFilterScheduleEndMinutesKey] respondsToSelector:@selector(integerValue)]
+            ? [rule[kSNFilterScheduleEndMinutesKey] integerValue] : kSNFilterScheduleDefaultEndMinutes;
+        self.activeDuringQuietHoursDraft = [rule[kSNFilterActiveDuringQuietHoursKey] boolValue];
+    }
     NSMutableArray *items = [NSMutableArray array];
     PSSpecifier *matchGroup = [PSSpecifier preferenceSpecifierNamed:@"MATCH" target:self set:NULL get:NULL detail:nil cell:PSGroupCell edit:nil];
     [matchGroup setProperty:@"Match a literal phrase in the title, subtitle, or body." forKey:@"footerText"];
@@ -349,6 +393,20 @@ static UITextField *SNFilterTextFieldInView(UIView *view)
         [custom setProperty:@YES forKey:@"isEditable"]; [custom setProperty:@YES forKey:@"textFieldIsSingleLine"];
         [custom setProperty:@YES forKey:@"noAutoCorrect"]; [custom setProperty:@YES forKey:@"noAutoCaps"]; [custom setProperty:@"SNFilterCustomCell" forKey:@"id"]; [items addObject:custom];
     }
+    PSSpecifier *scheduleGroup = [PSSpecifier preferenceSpecifierNamed:@"SCHEDULE" target:self set:NULL get:NULL detail:nil cell:PSGroupCell edit:nil];
+    [scheduleGroup setProperty:@"When enabled, this filter only applies during the selected time." forKey:@"footerText"];
+    [items addObject:scheduleGroup];
+    PSSpecifier *scheduleToggle = [PSSpecifier preferenceSpecifierNamed:@"Use Schedule" target:self set:@selector(setScheduleEnabled:specifier:) get:@selector(getScheduleEnabled:) detail:nil cell:PSSwitchCell edit:nil];
+    [items addObject:scheduleToggle];
+    if (self.scheduleEnabledDraft) {
+        [items addObject:[self minuteSpecifierWithTitle:@"From" key:kSNFilterScheduleStartMinutesKey]];
+        [items addObject:[self minuteSpecifierWithTitle:@"To" key:kSNFilterScheduleEndMinutesKey]];
+    }
+    PSSpecifier *quietGroup = [PSSpecifier preferenceSpecifierNamed:@"QUIET HOURS" target:self set:NULL get:NULL detail:nil cell:PSGroupCell edit:nil];
+    [quietGroup setProperty:@"When enabled, this filter remains eligible during global Quiet Hours. When disabled, this filter is ignored during Quiet Hours." forKey:@"footerText"];
+    [items addObject:quietGroup];
+    PSSpecifier *quietToggle = [PSSpecifier preferenceSpecifierNamed:@"Active During Quiet Hours" target:self set:@selector(setActiveDuringQuietHours:specifier:) get:@selector(getActiveDuringQuietHours:) detail:nil cell:PSSwitchCell edit:nil];
+    [items addObject:quietToggle];
     PSSpecifier *save = [PSSpecifier preferenceSpecifierNamed:@"Save" target:self set:NULL get:NULL detail:nil cell:PSButtonCell edit:nil]; save.buttonAction = @selector(saveFilter); [items addObject:save];
     if (!self.newFilter) { PSSpecifier *del = [PSSpecifier preferenceSpecifierNamed:@"Delete Filter" target:self set:NULL get:NULL detail:nil cell:PSButtonCell edit:nil]; del.buttonAction = @selector(deleteFilter); [items addObject:del]; }
     _specifiers = [items mutableCopy];
@@ -363,6 +421,47 @@ static UITextField *SNFilterTextFieldInView(UIView *view)
 - (id)getCustom:(PSSpecifier *)specifier { return self.customDraft; }
 - (void)setCustom:(id)value specifier:(PSSpecifier *)specifier { self.customDraft = [value isKindOfClass:NSString.class] ? value : @""; }
 
+- (PSSpecifier *)minuteSpecifierWithTitle:(NSString *)title key:(NSString *)key
+{
+    PSSpecifier *specifier = [PSSpecifier preferenceSpecifierNamed:title target:self set:NULL get:NULL detail:[SNMinuteOfDayController class] cell:PSLinkCell edit:nil];
+    [specifier setProperty:key forKey:@"minuteKey"];
+    [specifier setProperty:[SNMinuteOfDayValueCell class] forKey:@"cellClass"];
+    return specifier;
+}
+
+- (NSInteger)minuteValueForKey:(NSString *)key
+{
+    return [key isEqualToString:kSNFilterScheduleStartMinutesKey] ? self.scheduleStartDraft : self.scheduleEndDraft;
+}
+
+- (NSString *)minuteTitleForKey:(NSString *)key
+{
+    NSInteger minute = [self minuteValueForKey:key];
+    return [NSString stringWithFormat:@"%02ld:%02ld", (long)(minute / 60), (long)(minute % 60)];
+}
+
+- (void)setMinuteValue:(NSInteger)value forKey:(NSString *)key
+{
+    if (value < 0 || value >= 1440) return;
+    if ([key isEqualToString:kSNFilterScheduleStartMinutesKey]) self.scheduleStartDraft = value;
+    else if ([key isEqualToString:kSNFilterScheduleEndMinutesKey]) self.scheduleEndDraft = value;
+    else return;
+    _specifiers = nil;
+    [self reloadSpecifiers];
+}
+
+- (id)getScheduleEnabled:(PSSpecifier *)specifier { return @(self.scheduleEnabledDraft); }
+- (void)setScheduleEnabled:(id)value specifier:(PSSpecifier *)specifier
+{
+    self.matchDraft = [self currentNativeTextForSpecifierID:@"SNFilterMatchCell" fallback:self.matchDraft];
+    self.customDraft = [self currentNativeTextForSpecifierID:@"SNFilterCustomCell" fallback:self.customDraft];
+    self.scheduleEnabledDraft = [value boolValue];
+    _specifiers = nil;
+    [self reloadSpecifiers];
+}
+- (id)getActiveDuringQuietHours:(PSSpecifier *)specifier { return @(self.activeDuringQuietHoursDraft); }
+- (void)setActiveDuringQuietHours:(id)value specifier:(PSSpecifier *)specifier { self.activeDuringQuietHoursDraft = [value boolValue]; }
+
 - (NSString *)currentNativeTextForSpecifierID:(NSString *)specifierID fallback:(NSString *)fallback
 {
     PSTableCell *cell = [self cachedCellForSpecifierID:specifierID];
@@ -375,7 +474,8 @@ static UITextField *SNFilterTextFieldInView(UIView *view)
     if (![value isEqualToString:kSNNotificationFilterActionDontSpeak] &&
         ![value isEqualToString:kSNNotificationFilterActionSpeakNotification] &&
         ![value isEqualToString:kSNNotificationFilterActionSpeakMatched] &&
-        ![value isEqualToString:kSNNotificationFilterActionSpeakCustom]) return;
+        ![value isEqualToString:kSNNotificationFilterActionSpeakCustom] &&
+        ![value isEqualToString:kSNNotificationFilterActionRemoveMatched]) return;
     self.matchDraft = [self currentNativeTextForSpecifierID:@"SNFilterMatchCell" fallback:self.matchDraft];
     self.customDraft = [self currentNativeTextForSpecifierID:@"SNFilterCustomCell" fallback:self.customDraft];
     self.actionDraft = value;
@@ -399,7 +499,12 @@ static UITextField *SNFilterTextFieldInView(UIView *view)
     self.matchDraft = SNFilterTrim(self.matchDraft); self.customDraft = SNFilterTrim(self.customDraft);
     if (self.matchDraft.length == 0) { [self showValidation:@"Enter a phrase to match."]; return; }
     if ([self.actionDraft isEqualToString:kSNNotificationFilterActionSpeakCustom] && self.customDraft.length == 0) { [self showValidation:@"Enter custom text for this action."]; return; }
-    NSMutableDictionary *rule = [@{ @"match": self.matchDraft, @"action": self.actionDraft } mutableCopy];
+    NSMutableDictionary *rule = [@{ @"match": self.matchDraft,
+                                    @"action": self.actionDraft,
+                                    kSNFilterScheduleEnabledKey: @(self.scheduleEnabledDraft),
+                                    kSNFilterScheduleStartMinutesKey: @(self.scheduleStartDraft),
+                                    kSNFilterScheduleEndMinutesKey: @(self.scheduleEndDraft),
+                                    kSNFilterActiveDuringQuietHoursKey: @(self.activeDuringQuietHoursDraft) } mutableCopy];
     if ([self.actionDraft isEqualToString:kSNNotificationFilterActionSpeakCustom]) rule[@"customText"] = self.customDraft;
     NSMutableArray *filters = [SNFiltersForBundle(self.bundleID) mutableCopy];
     if (self.newFilter) [filters addObject:rule];
