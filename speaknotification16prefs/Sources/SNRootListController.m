@@ -743,6 +743,7 @@ static BOOL SNIsSpeakLogFile(NSString *filename) {
 - (BOOL)sn_debugLoggingEnabled;
 - (void)sn_updateBetaAccessVisibilityAnimated:(BOOL)animated;
 - (void)sn_refreshSpeechVolumeSpecifier;
+- (PSSpecifier *)sn_specifierForID:(NSString *)ident;
 @end
 
 static void SNReleaseCheckResultChanged(__unused CFNotificationCenterRef center,
@@ -2232,6 +2233,10 @@ static NSString * const kAppsCacheKeyLiteral = @"cachedVisibleApps_v7";
 
             // Debug
             @"debugLoggingEnabled": @NO,
+
+            // Sender filtering
+            kSNIgnoreUnknownNumbersKey: @NO,
+            kSNUnknownNumberExcludedAppsKey: @[],
 
             // Release alerts
             @"releaseAlertsEnabled": @YES,

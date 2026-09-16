@@ -164,6 +164,36 @@ static inline NSString *sn_strip_invisible_format_chars(NSString *s)
     return out;
 }
 
++ (BOOL)looksLikePhoneNumberSender:(id)candidate
+{
+    if (![candidate isKindOfClass:NSString.class]) return NO;
+    NSString *value = [(NSString *)candidate stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (value.length == 0) return NO;
+
+    static NSCharacterSet *formatting;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *set = [[NSCharacterSet whitespaceAndNewlineCharacterSet] mutableCopy];
+        [set addCharactersInString:@"\u00A0-\u2013()."];
+        formatting = [set copy];
+        [set release];
+    });
+
+    NSUInteger digits = 0;
+    BOOL leadingPlusConsumed = NO;
+    for (NSUInteger i = 0; i < value.length; i++) {
+        unichar c = [value characterAtIndex:i];
+        if (sn_is_ascii_digit(c)) {
+            digits++;
+        } else if (c == '+' && digits == 0 && !leadingPlusConsumed) {
+            leadingPlusConsumed = YES;
+        } else if (![formatting characterIsMember:c]) {
+            return NO;
+        }
+    }
+    return digits >= 7 && digits <= 15;
+}
+
 + (NSString *)safeSubstring:(NSString *)s maxLen:(NSUInteger)maxLen
 {
     if (s.length <= maxLen) return s;

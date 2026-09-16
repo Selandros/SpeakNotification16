@@ -27,6 +27,8 @@ extern NSString * const kWiredAudioDiagnosticKey;
 extern NSString * const kTrustedConnectionAliasesV1Key;
 extern NSString * const kSNPerAppNotificationFiltersV1Key;
 extern NSString * const kSNPerAppOnlySpeakMatchingFiltersV1Key;
+extern NSString * const kSNIgnoreUnknownNumbersKey;
+extern NSString * const kSNUnknownNumberExcludedAppsKey;
 extern NSString * const kSNQuietHoursEnabledKey;
 extern NSString * const kSNQuietHoursStartMinutesKey;
 extern NSString * const kSNQuietHoursEndMinutesKey;

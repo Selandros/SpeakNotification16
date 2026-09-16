@@ -32,6 +32,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable NSString *)trimOrNil:(id)obj;
 + (NSString *)safeStr:(id)obj;
 + (NSString *)normalizePhoneSimple:(NSString *)raw;
++ (BOOL)looksLikePhoneNumberSender:(id)candidate;
 + (NSString *)safeSubstring:(NSString *)s maxLen:(NSUInteger)maxLen;
 + (NSString *)normalizeWhitespace:(NSString *)s;
 

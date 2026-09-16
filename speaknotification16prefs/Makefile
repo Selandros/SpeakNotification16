@@ -22,7 +22,8 @@ SpeakNotification16Prefs_FILES = ../SNSharedKeys.m \
     Sources/LanguagesListController.m \
     Sources/SNLanguageVoiceListController.m \
     Sources/SNLanguageVoiceController.m \
-    Sources/SNComingListController.m
+    Sources/SNComingListController.m \
+    Sources/SNUnknownNumberExcludedAppsController.m
 
 SpeakNotification16Prefs_INSTALL_PATH = /Library/PreferenceBundles
 SpeakNotification16Prefs_FRAMEWORKS = UIKit AVFoundation

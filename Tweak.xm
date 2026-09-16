@@ -1674,14 +1674,14 @@ static BOOL sn_audit_write_notif(NSDictionary *s, NSString *txnText)
            s[@"voiceIdentifier"] ?: @"-",
            s[@"voiceSource"] ?: @"-",
            s[@"voiceQuality"] ?: @"-"];
-    SNLOGFMT(@"[NOTIF] %02llu | txn=%@ sectionID=%@ title_len=%@ subtitle_len=%@ body_len=%@ | wifi=%@ bt=%@ wired=%@ broadWired=%@ trust=%@ trustedBy=%@ callGate=%@ | route=%@ otherAudio=%@ volume=%@%% muted=%@ locked=%@ fg=%@ screen=%@ battery=%@ | sound=%@ fmt=%@ | lang=%@ %@ | policy=%@ quietHours=%@ queue=%@ filter=%@ action=%@ result=%@ voice=%@",
+    SNLOGFMT(@"[NOTIF] %02llu | txn=%@ sectionID=%@ title_len=%@ subtitle_len=%@ body_len=%@ | wifi=%@ bt=%@ wired=%@ broadWired=%@ trust=%@ trustedBy=%@ callGate=%@ | route=%@ otherAudio=%@ volume=%@%% muted=%@ locked=%@ fg=%@ screen=%@ battery=%@ | sound=%@ fmt=%@ | lang=%@ %@ | policy=%@ senderPolicy=%@ quietHours=%@ queue=%@ filter=%@ action=%@ result=%@ voice=%@",
              [s[@"seq"] unsignedLongLongValue], txnText ?: @"-",
              s[@"sectionID"] ?: @"-", s[@"titleLen"] ?: @0, s[@"subtitleLen"] ?: @0, s[@"bodyLen"] ?: @0,
              s[@"wifi"] ?: @"-", s[@"bluetooth"] ?: @"-", s[@"wired"] ?: @"-", s[@"broadWired"] ?: @"-",
              s[@"trust"] ?: @"-", s[@"trustedBy"] ?: @"-", s[@"callGate"] ?: @"-",
              s[@"route"] ?: @"-", s[@"otherAudio"] ?: @"-", s[@"volume"] ?: @"-", s[@"muted"] ?: @"-", s[@"locked"] ?: @"-",
              s[@"foreground"] ?: @"-", s[@"screen"] ?: @"-", s[@"battery"] ?: @"-", s[@"sound"] ?: @"-",
-             s[@"format"] ?: @"-", s[@"lang"] ?: @"-", languageText, s[@"policy"] ?: @"-", s[@"quietHours"] ?: @"notEvaluated", s[@"queue"] ?: @"-",
+             s[@"format"] ?: @"-", s[@"lang"] ?: @"-", languageText, s[@"policy"] ?: @"-", s[@"senderPolicy"] ?: @"-", s[@"quietHours"] ?: @"notEvaluated", s[@"queue"] ?: @"-",
              s[@"filter"] ?: @"none", s[@"action"] ?: @"-", s[@"result"] ?: @"-",
              voiceText);
     return YES;
@@ -5909,7 +5909,7 @@ static NSString * const kReleaseTokenValidationResultRequestIDKey = @"releaseTok
 
 static NSString * const kReleaseRepo = @"Selandros/SpeakNotification16";
 static NSString * const kReleaseSectionID = @"com.apple.Preferences";
-static NSString * const kReleaseInstalledVersion = @"2.1.7";
+static NSString * const kReleaseInstalledVersion = @"2.1.8";
 static NSString * const kReleaseAssetPrefix = @"com.selandros.speaknotification16_";
 static NSString * const kReleaseAssetSuffix = @"_iphoneos-arm64.deb";
 static NSString * const kReleaseAPIURLString = @"https://api.github.com/repos/Selandros/SpeakNotification16/releases/latest";
@@ -7971,7 +7971,7 @@ static uint64_t SN_Seq = 0;
                     @"foreground": (fgBID.length ? [NSString stringWithFormat:@"%@(%@)", fgBID, (fgName ?: @"-")] : @"-"),
                     @"screen": [NSString stringWithFormat:@"%d%% %@", brightPct, (orient ?: @"-")],
                     @"battery": [NSString stringWithFormat:@"%d%%(%@) lowPower=%@", battPct, (battState ?: @"-"), (lpm ? @"YES" : @"NO")],
-                    @"queue": @"none", @"policy": @"notEvaluated",
+                    @"queue": @"none", @"policy": @"notEvaluated", @"senderPolicy": @"notEvaluated",
                     @"callGate": @"notEvaluated", @"sound": @"notAttempted",
                     @"format": @"notEvaluated", @"lang": @"notEvaluated",
                     @"langReason": @"notEvaluated", @"langDiagnostic": @"notEvaluated",
@@ -8062,6 +8062,29 @@ static uint64_t SN_Seq = 0;
                     return;
                 }
                 sn_audit_update_sequence(seq, @{@"callGate": @"allow"});
+
+                // Sender filtering is an outer gate; notification bodies are never inspected here.
+                if (allowTTS) {
+                    BOOL ignoreUnknown = [defs boolForKey:kSNIgnoreUnknownNumbersKey];
+                    NSArray *excludedApps = [defs objectForKey:kSNUnknownNumberExcludedAppsKey];
+                    BOOL excludedApp = [excludedApps isKindOfClass:NSArray.class] &&
+                        [excludedApps containsObject:(sectionID ?: @"")];
+                    NSMutableDictionary *senderAudit = [auditIngress mutableCopy];
+                    senderAudit[@"senderPolicy"] = excludedApp ? @"excludedApp" : (ignoreUnknown ? @"checked" : @"disabled");
+                    if (ignoreUnknown && !excludedApp) {
+                        NSString *senderCandidate = subtitle.length ? subtitle : (title ?: @"");
+                        if ([SNStringUtils looksLikePhoneNumberSender:senderCandidate]) {
+                            senderAudit[@"senderPolicy"] = @"unknownNumber";
+                            auditIngress = [senderAudit autorelease];
+                            allowTTS = NO;
+                            sn_audit_emit_denied(auditIngress, @"unknownNumber");
+                            didOrig = YES;
+                            %orig(bulletin, destinations);
+                            return;
+                        }
+                    }
+                    auditIngress = [senderAudit autorelease];
+                }
 
                 if (bulletinID.length > 0 && sn_seen_check_and_add_once(bulletinID)) {
                     sn_audit_emit_denied(auditIngress, @"duplicateBulletin");
